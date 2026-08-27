@@ -1,0 +1,8 @@
+# 编译产物
+netlesspkg
+netlesspkg.exe
+netlesspkg_linux_*
+*.bundle
+
+# 临时文件
+*.part
