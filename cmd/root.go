@@ -58,5 +58,9 @@ func printHelp() {
   [外网] netlesspkg sync-meta -i meta_request.json -o metadata.bundle
   [内网] netlesspkg plan -i metadata.bundle -p nginx,docker-ce -o download_plan.json
   [外网] netlesspkg fetch -i download_plan.json -o packages.bundle
-  [内网] netlesspkg install -i packages.bundle -p nginx,docker-ce`)
+  [内网] netlesspkg install -i packages.bundle -p nginx,docker-ce
+
+高级参数:
+  --replace, -r <old>=<new>   外网下载时重写 URL (如 --replace mirrors.cloud.aliyuncs.com=mirrors.aliyun.com)
+  --no-auto-replace           禁用常见云厂商内网源(阿里云/腾讯云/华为云)的自动公网映射`)
 }
