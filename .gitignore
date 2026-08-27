@@ -1,7 +1,8 @@
 # 编译产物
 netlesspkg
 netlesspkg.exe
-netlesspkg_linux_*
+netlesspkg_*
+dist/
 *.bundle
 
 # 临时文件
