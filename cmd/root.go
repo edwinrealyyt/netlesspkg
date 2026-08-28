@@ -3,6 +3,7 @@ package cmd
 import (
 	"fmt"
 	"os"
+	"strings"
 )
 
 func Execute() {
@@ -11,8 +12,15 @@ func Execute() {
 		os.Exit(1)
 	}
 
-	command := os.Args[1]
-	args := os.Args[2:]
+	// 从参数列表中找到第一个非标志参数作为子命令
+	// 支持 "netlesspkg install -i xxx" 和 "netlesspkg -i xxx install" 两种写法
+	command, args := findCommand(os.Args[1:])
+
+	if command == "" {
+		fmt.Println("错误: 未指定子命令")
+		printHelp()
+		os.Exit(1)
+	}
 
 	switch command {
 	case "export":
@@ -27,15 +35,57 @@ func Execute() {
 		runInstall(args)
 	case "verify":
 		runVerify(args)
-	case "help":
+	case "help", "-h", "--help":
 		printHelp()
-	case "version":
+	case "version", "-v", "--version":
 		fmt.Println("NetlessPkg v0.1.0")
 	default:
 		fmt.Printf("未知命令: %s\n", command)
+		fmt.Println("提示: 请将子命令放在参数前面，例如:")
+		fmt.Println("  netlesspkg install -i packages.bundle -p nginx")
+		fmt.Println()
 		printHelp()
 		os.Exit(1)
 	}
+}
+
+// findCommand 从参数列表中找到第一个非标志参数作为子命令名。
+// 剩余的标志和参数都作为子命令的 args 返回。
+// 例如：["-i", "foo.json", "plan", "-p", "nginx"]
+//
+//	返回 command="plan", args=["-i", "foo.json", "-p", "nginx"]
+func findCommand(rawArgs []string) (command string, args []string) {
+	validCommands := map[string]bool{
+		"export": true, "sync-meta": true, "plan": true,
+		"fetch": true, "install": true, "verify": true,
+		"help": true, "version": true,
+		"-h": true, "--help": true, "-v": true, "--version": true,
+	}
+
+	cmdIndex := -1
+	for i, arg := range rawArgs {
+		if validCommands[arg] {
+			cmdIndex = i
+			command = arg
+			break
+		}
+	}
+
+	if cmdIndex == -1 {
+		// 没有找到已知子命令，把第一个非标志参数当作命令（会在 switch 中触发"未知命令"）
+		for i, arg := range rawArgs {
+			if !strings.HasPrefix(arg, "-") {
+				return arg, append(rawArgs[:i], rawArgs[i+1:]...)
+			}
+		}
+		return "", rawArgs
+	}
+
+	// 将子命令从参数列表中移除，其余的都传给子命令
+	args = make([]string, 0, len(rawArgs)-1)
+	args = append(args, rawArgs[:cmdIndex]...)
+	args = append(args, rawArgs[cmdIndex+1:]...)
+	return command, args
 }
 
 func printHelp() {
@@ -60,7 +110,7 @@ func printHelp() {
   [外网] netlesspkg fetch -i download_plan.json -o packages.bundle
   [内网] netlesspkg install -i packages.bundle -p nginx,docker-ce
 
-高级参数:
+高级参数 (sync-meta / fetch 可用):
   --replace, -r <old>=<new>   外网下载时重写 URL (如 --replace mirrors.cloud.aliyuncs.com=mirrors.aliyun.com)
   --no-auto-replace           禁用常见云厂商内网源(阿里云/腾讯云/华为云)的自动公网映射`)
 }
