@@ -342,78 +342,18 @@ func (m *YUMManager) queryWithLocalRepos(metaDir string, isDnf bool, targetPacka
 		tmpCacheDir := filepath.Join(tmpReposDir, "cache")
 		os.MkdirAll(tmpCacheDir, 0755)
 
-		// 1. 获取所有需要的目标包及递归依赖包名集合
-		allPkgNames := make(map[string]bool)
-		for _, pkg := range targetPackages {
-			allPkgNames[pkg] = true
+		// 1. 增量依赖求解：以本地系统已有 RPM 为基准，仅下载真正缺失的依赖包
+		fmt.Printf("[plan] 正在以本机环境为基准，增量计算 %s 的缺失依赖包...\n", strings.Join(targetPackages, ", "))
+
+		neededPackages, err := m.resolveMissingDependencies(tmpReposDir, tmpCacheDir, releaseVer, repoIDs, targetPackages)
+		if err != nil {
+			fmt.Printf("[plan] 增量解析警告: %v，回退到全局依赖列表\n", err)
+			neededPackages = targetPackages
 		}
 
-		// 2. 第一阶段：通过 DNF 解析递归依赖包清单 (Pass 1: Resolve Dependency Tree)
-		fmt.Printf("[plan] 正在深度递归解析 %s 的全部底层依赖包...\n", strings.Join(targetPackages, ", "))
+		fmt.Printf("[plan] 依赖分析完成，目标系统需安装 %d 个离线包（已自动排除系统已满足的底层库）\n", len(neededPackages))
 
-		argsDeps := []string{
-			"--noplugins",
-			"--setopt=reposdir=" + tmpReposDir,
-			"--setopt=cachedir=" + tmpCacheDir,
-			"--setopt=keepcache=1",
-			"repoquery", "--resolve", "--requires", "--recursive",
-			"--disablerepo=*",
-			"--releasever=" + releaseVer,
-		}
-		for _, id := range repoIDs {
-			argsDeps = append(argsDeps, "--enablerepo="+id)
-		}
-		argsDeps = append(argsDeps, targetPackages...)
-
-		cmdDeps := exec.Command(m.cmdPath, argsDeps...)
-		var outDeps, stderrDeps bytes.Buffer
-		cmdDeps.Stdout = &outDeps
-		cmdDeps.Stderr = &stderrDeps
-
-		if err := cmdDeps.Run(); err == nil {
-			for _, line := range strings.Split(outDeps.String(), "\n") {
-				line = strings.TrimSpace(line)
-				if line != "" && !strings.HasPrefix(line, "#") && !strings.Contains(line, " ") {
-					allPkgNames[line] = true
-				}
-			}
-		} else {
-			// 如果 --resolve --requires 失败，尝试使用 --deplist 提取 provider 包名
-			argsDeplist := []string{
-				"--noplugins",
-				"--setopt=reposdir=" + tmpReposDir,
-				"--setopt=cachedir=" + tmpCacheDir,
-				"repoquery", "--deplist",
-				"--disablerepo=*",
-				"--releasever=" + releaseVer,
-			}
-			for _, id := range repoIDs {
-				argsDeplist = append(argsDeplist, "--enablerepo="+id)
-			}
-			argsDeplist = append(argsDeplist, targetPackages...)
-			cmdDeplist := exec.Command(m.cmdPath, argsDeplist...)
-			var outDeplist bytes.Buffer
-			cmdDeplist.Stdout = &outDeplist
-			if err := cmdDeplist.Run(); err == nil {
-				for _, line := range strings.Split(outDeplist.String(), "\n") {
-					line = strings.TrimSpace(line)
-					if strings.HasPrefix(line, "provider:") {
-						parts := strings.Fields(line)
-						if len(parts) >= 2 {
-							allPkgNames[parts[1]] = true
-						}
-					}
-				}
-			}
-		}
-
-		// 3. 第二阶段：根据完整包名清单查询所有 RPM 文件的真实下载 URL (Pass 2: Query Download URLs)
-		pkgList := make([]string, 0, len(allPkgNames))
-		for p := range allPkgNames {
-			pkgList = append(pkgList, p)
-		}
-		fmt.Printf("[plan] 依赖解析完成，共需下载 %d 个软件包（含目标包及其全部依赖）\n", len(pkgList))
-
+		// 2. 查询所有确实需要下载的包的下载 URL
 		argsURLs := []string{
 			"--noplugins",
 			"--setopt=reposdir=" + tmpReposDir,
@@ -426,7 +366,7 @@ func (m *YUMManager) queryWithLocalRepos(metaDir string, isDnf bool, targetPacka
 		for _, id := range repoIDs {
 			argsURLs = append(argsURLs, "--enablerepo="+id)
 		}
-		argsURLs = append(argsURLs, pkgList...)
+		argsURLs = append(argsURLs, neededPackages...)
 
 		cmdURLs := exec.Command(m.cmdPath, argsURLs...)
 		var outURLs, stderrURLs bytes.Buffer
@@ -441,32 +381,6 @@ func (m *YUMManager) queryWithLocalRepos(metaDir string, isDnf bool, targetPacka
 			line = strings.TrimSpace(line)
 			if isPackageURL(line) {
 				allURLs[line] = true
-			}
-		}
-
-		// 4. 补充阶段：使用 dnf download --url --resolve 检查是否有遗漏
-		argsDownload := []string{
-			"--noplugins",
-			"--setopt=reposdir=" + tmpReposDir,
-			"--setopt=cachedir=" + tmpCacheDir,
-			"download", "--url", "--resolve",
-			"--disablerepo=*",
-			"--releasever=" + releaseVer,
-		}
-		for _, id := range repoIDs {
-			argsDownload = append(argsDownload, "--enablerepo="+id)
-		}
-		argsDownload = append(argsDownload, targetPackages...)
-
-		cmdDownload := exec.Command(m.cmdPath, argsDownload...)
-		var outDownload bytes.Buffer
-		cmdDownload.Stdout = &outDownload
-		if err := cmdDownload.Run(); err == nil {
-			for _, line := range strings.Split(outDownload.String(), "\n") {
-				line = strings.TrimSpace(line)
-				if isPackageURL(line) {
-					allURLs[line] = true
-				}
 			}
 		}
 	} else {
@@ -495,7 +409,10 @@ func (m *YUMManager) queryWithLocalRepos(metaDir string, isDnf bool, targetPacka
 			for _, line := range strings.Split(outDeps.String(), "\n") {
 				line = strings.TrimSpace(line)
 				if line != "" {
-					allPkgNames[line] = true
+					// 过滤掉系统已安装的包
+					if !isInstalledOnSystem(line) {
+						allPkgNames[line] = true
+					}
 				}
 			}
 		}
@@ -781,4 +698,167 @@ func (m *YUMManager) InjectPackagesAndInstall(pkgDir string, targetPackages []st
 	}
 
 	return fmt.Errorf("所有离线安装策略均失败，请查看上方输出排查是否存在缺失的底层系统依赖")
+}
+
+// resolveMissingDependencies 以本机已安装 RPM 状态为基准，BFS 递归求解目标包真正缺失的依赖包
+func (m *YUMManager) resolveMissingDependencies(tmpReposDir, tmpCacheDir, releaseVer string, repoIDs []string, targetPackages []string) ([]string, error) {
+	installedPkgs, installedProvides := getSystemInstalledCapabilities()
+
+	neededPackages := make(map[string]bool)
+	queue := make([]string, 0)
+
+	for _, pkg := range targetPackages {
+		neededPackages[pkg] = true
+		queue = append(queue, pkg)
+	}
+
+	visitedPackages := make(map[string]bool)
+	checkedRequires := make(map[string]bool)
+
+	for len(queue) > 0 {
+		current := queue[0]
+		queue = queue[1:]
+
+		if visitedPackages[current] {
+			continue
+		}
+		visitedPackages[current] = true
+
+		// 查询当前包的直接 requirements
+		args := []string{
+			"--noplugins",
+			"--setopt=reposdir=" + tmpReposDir,
+			"--setopt=cachedir=" + tmpCacheDir,
+			"repoquery", "--requires",
+			"--disablerepo=*",
+			"--releasever=" + releaseVer,
+		}
+		for _, id := range repoIDs {
+			args = append(args, "--enablerepo="+id)
+		}
+		args = append(args, current)
+
+		out, err := exec.Command(m.cmdPath, args...).Output()
+		if err != nil {
+			continue
+		}
+
+		missingRequires := make([]string, 0)
+		for _, req := range strings.Split(string(out), "\n") {
+			req = strings.TrimSpace(req)
+			if req == "" || strings.HasPrefix(req, "#") {
+				continue
+			}
+			// 过滤掉 rpmlib 内部能力 (如 rpmlib(PayloadFilesHavePrefix) 等)
+			if strings.HasPrefix(req, "rpmlib(") {
+				continue
+			}
+
+			if checkedRequires[req] {
+				continue
+			}
+			checkedRequires[req] = true
+
+			// 检查本地系统是否已经满足
+			reqName := req
+			if idx := strings.Index(req, " "); idx != -1 {
+				reqName = req[:idx]
+			}
+			if installedProvides[req] || installedProvides[reqName] || installedPkgs[reqName] {
+				// 本地已满足，跳过！不向下递归！
+				continue
+			}
+
+			// 进一步使用 rpm -q --whatprovides 二次确认
+			if err := exec.Command("rpm", "-q", "--whatprovides", req).Run(); err == nil {
+				installedProvides[req] = true
+				continue
+			}
+
+			missingRequires = append(missingRequires, req)
+		}
+
+		if len(missingRequires) == 0 {
+			continue
+		}
+
+		// 在离线仓库中查询是谁提供了这些 missing requires
+		argsWhat := []string{
+			"--noplugins",
+			"--setopt=reposdir=" + tmpReposDir,
+			"--setopt=cachedir=" + tmpCacheDir,
+			"repoquery", "--whatprovides",
+			"--disablerepo=*",
+			"--releasever=" + releaseVer,
+		}
+		for _, id := range repoIDs {
+			argsWhat = append(argsWhat, "--enablerepo="+id)
+		}
+		argsWhat = append(argsWhat, missingRequires...)
+
+		outProviders, err := exec.Command(m.cmdPath, argsWhat...).Output()
+		if err != nil {
+			continue
+		}
+
+		for _, provider := range strings.Split(string(outProviders), "\n") {
+			provider = strings.TrimSpace(provider)
+			if provider == "" || strings.HasPrefix(provider, "#") {
+				continue
+			}
+			if !neededPackages[provider] {
+				neededPackages[provider] = true
+				queue = append(queue, provider)
+			}
+		}
+	}
+
+	result := make([]string, 0, len(neededPackages))
+	for pkg := range neededPackages {
+		result = append(result, pkg)
+	}
+
+	return result, nil
+}
+
+// getSystemInstalledCapabilities 获取本机已安装的全部 RPM 包名和 Provides
+func getSystemInstalledCapabilities() (map[string]bool, map[string]bool) {
+	installedPkgs := make(map[string]bool)
+	installedProvides := make(map[string]bool)
+
+	// 1. 获取已安装包名
+	outPkgs, err := exec.Command("rpm", "-qa", "--qf", "%{NAME}\n").Output()
+	if err == nil {
+		for _, line := range strings.Split(string(outPkgs), "\n") {
+			line = strings.TrimSpace(line)
+			if line != "" {
+				installedPkgs[line] = true
+			}
+		}
+	}
+
+	// 2. 获取已安装 provides
+	outProvides, err := exec.Command("rpm", "-qa", "--provides").Output()
+	if err == nil {
+		for _, line := range strings.Split(string(outProvides), "\n") {
+			line = strings.TrimSpace(line)
+			if line != "" {
+				installedProvides[line] = true
+				if idx := strings.Index(line, " "); idx != -1 {
+					installedProvides[line[:idx]] = true
+				}
+				if idx := strings.Index(line, "="); idx != -1 {
+					installedProvides[line[:idx]] = true
+				}
+			}
+		}
+	}
+
+	return installedPkgs, installedProvides
+}
+
+// isInstalledOnSystem 检查系统是否已经安装了该包
+func isInstalledOnSystem(pkgName string) bool {
+	err := exec.Command("rpm", "-q", pkgName).Run()
+	return err == nil
 }
