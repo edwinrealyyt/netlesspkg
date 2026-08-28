@@ -42,3 +42,23 @@ func TestRestoreRemoteURLs(t *testing.T) {
 		t.Errorf("http URL 应该保持原样")
 	}
 }
+
+func TestExtractRPMBaseName(t *testing.T) {
+	cases := map[string]string{
+		"imlib2-1.4.9-8.el8.aarch64":             "imlib2",
+		"fuse3-3.2.1-12.el8.aarch64.rpm":         "fuse3",
+		"xorg-x11-xinit-1.4.0-1.el8.aarch64":     "xorg-x11-xinit",
+		"glibc-2.32-1.23.al8.aarch64":            "glibc",
+		"coreutils-single-8.30-20.0.1.al8.aarch64": "coreutils-single",
+		"xrdp-1:0.10.6.1-3.el8.aarch64":          "xrdp",
+		"xrdp":                                   "xrdp",
+	}
+
+	for input, expected := range cases {
+		actual := extractRPMBaseName(input)
+		if actual != expected {
+			t.Errorf("extractRPMBaseName(%q) = %q, 期望: %q", input, actual, expected)
+		}
+	}
+}
+
