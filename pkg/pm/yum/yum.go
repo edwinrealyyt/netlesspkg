@@ -653,17 +653,36 @@ func (m *YUMManager) InjectPackagesAndInstall(pkgDir string, targetPackages []st
 		return fmt.Errorf("包管理器未初始化")
 	}
 
-	// 使用 --nogpgcheck 和 --noplugins 进行顺畅的离线本地包安装
-	args := []string{"-c", fmt.Sprintf("%s install -y --nogpgcheck --noplugins %s/*.rpm", m.cmdPath, strings.ReplaceAll(pkgDir, "\\", "/"))}
-	cmd := exec.Command("sh", args...)
-	
-	var stderr bytes.Buffer
-	cmd.Stderr = &stderr
-	
-	err = cmd.Run()
-	if err != nil {
-		return fmt.Errorf("安装软件包失败: %v, stderr: %s", err, stderr.String())
+	cleanDir := strings.ReplaceAll(pkgDir, "\\", "/")
+	rpmFiles, _ := filepath.Glob(filepath.Join(pkgDir, "*.rpm"))
+	if len(rpmFiles) == 0 {
+		return fmt.Errorf("在解压目录中未找到任何 .rpm 文件: %s", pkgDir)
 	}
 
-	return nil
+	fmt.Printf("[install] 正在准备安装 %d 个 RPM 离线包...\n", len(rpmFiles))
+
+	// 策略 1: dnf/yum install 配合 --disablerepo=* 禁用全部远端源，仅基于本地 RPM 文件计算依赖安装
+	cmdStr1 := fmt.Sprintf("%s install -y --nogpgcheck --noplugins --disablerepo=* %s/*.rpm", m.cmdPath, cleanDir)
+	fmt.Printf("[install] 策略 1: %s\n", cmdStr1)
+	cmd1 := exec.Command("sh", "-c", cmdStr1)
+	cmd1.Stdout = os.Stdout
+	cmd1.Stderr = os.Stderr
+	if err1 := cmd1.Run(); err1 == nil {
+		fmt.Println("\n✅ 软件包离线安装成功！")
+		return nil
+	}
+
+	// 策略 2: 使用 rpm 原生命令批量安装/更新
+	fmt.Println("\n[install] 策略 2: 尝试使用 rpm 命令直接安装...")
+	cmdStr2 := fmt.Sprintf("rpm -Uvh --replacepkgs --replacefiles %s/*.rpm", cleanDir)
+	fmt.Printf("[install] 执行: %s\n", cmdStr2)
+	cmd2 := exec.Command("sh", "-c", cmdStr2)
+	cmd2.Stdout = os.Stdout
+	cmd2.Stderr = os.Stderr
+	if err2 := cmd2.Run(); err2 == nil {
+		fmt.Println("\n✅ 软件包离线安装成功！")
+		return nil
+	}
+
+	return fmt.Errorf("所有离线安装策略均失败，请查看上方输出排查是否存在缺失的底层系统依赖")
 }
