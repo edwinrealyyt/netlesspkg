@@ -185,7 +185,6 @@ func (m *YUMManager) InjectMetaAndPlan(metaDir string, targetPackages []string) 
 	var lastErr error
 
 	// 策略 1: 使用从外网搬运回来的元数据构建本地离线 repo（推荐）
-	// metaDir 中的目录结构: {repo_id}/repodata/repomd.xml, primary.xml.gz, ...
 	fmt.Println("[plan] 策略 1: 使用搬运的离线元数据查询依赖...")
 	packages, err = m.queryWithLocalRepos(metaDir, isDnf, targetPackages)
 	if err == nil && len(packages) > 0 {
@@ -193,7 +192,7 @@ func (m *YUMManager) InjectMetaAndPlan(metaDir string, targetPackages []string) 
 	}
 	lastErr = err
 	if err != nil {
-		fmt.Printf("[plan] 策略 1 失败: %v\n", summarizeError(err))
+		fmt.Printf("[plan] 策略 1 失败:\n%v\n\n", err)
 	}
 
 	if isDnf {
@@ -205,7 +204,7 @@ func (m *YUMManager) InjectMetaAndPlan(metaDir string, targetPackages []string) 
 		}
 		lastErr = err
 		if err != nil {
-			fmt.Printf("[plan] 策略 2 失败: %v\n", summarizeError(err))
+			fmt.Printf("[plan] 策略 2 失败:\n%v\n\n", err)
 		}
 
 		// 策略 3: dnf repoquery（允许网络刷新）
@@ -216,7 +215,7 @@ func (m *YUMManager) InjectMetaAndPlan(metaDir string, targetPackages []string) 
 		}
 		lastErr = err
 		if err != nil {
-			fmt.Printf("[plan] 策略 3 失败: %v\n", summarizeError(err))
+			fmt.Printf("[plan] 策略 3 失败:\n%v\n\n", err)
 		}
 	} else {
 		// 传统 YUM: repoquery
@@ -226,6 +225,9 @@ func (m *YUMManager) InjectMetaAndPlan(metaDir string, targetPackages []string) 
 			return packages, nil
 		}
 		lastErr = err
+		if err != nil {
+			fmt.Printf("[plan] 策略 2 失败:\n%v\n\n", err)
+		}
 	}
 
 	if lastErr != nil {
@@ -326,56 +328,70 @@ func (m *YUMManager) queryWithLocalRepos(metaDir string, isDnf bool, targetPacka
 
 	if isDnf {
 		releaseVer := getReleaseVer()
-		// 查询目标包及依赖
-		args := []string{
-			"repoquery", "--location", "--resolve", "--requires", "--recursive",
+		tmpCacheDir := filepath.Join(tmpReposDir, "cache")
+		os.MkdirAll(tmpCacheDir, 0755)
+
+		// 1. 查询目标包本身的下载 URL
+		argsDirect := []string{
+			"--noplugins",
 			"--setopt=reposdir=" + tmpReposDir,
+			"--setopt=cachedir=" + tmpCacheDir,
+			"--setopt=keepcache=1",
+			"repoquery", "--location",
 			"--disablerepo=*",
 			"--releasever=" + releaseVer,
 		}
 		for _, id := range repoIDs {
-			args = append(args, "--enablerepo="+id)
+			argsDirect = append(argsDirect, "--enablerepo="+id)
 		}
-		args = append(args, targetPackages...)
+		argsDirect = append(argsDirect, targetPackages...)
 
-		cmd := exec.Command(m.cmdPath, args...)
-		var out, stderr bytes.Buffer
-		cmd.Stdout = &out
-		cmd.Stderr = &stderr
+		cmdDirect := exec.Command(m.cmdPath, argsDirect...)
+		var outDirect, stderrDirect bytes.Buffer
+		cmdDirect.Stdout = &outDirect
+		cmdDirect.Stderr = &stderrDirect
 
-		if err := cmd.Run(); err != nil {
-			return nil, fmt.Errorf("dnf repoquery (离线) 失败: %v\n  stderr: %s", err, firstLines(stderr.String(), 5))
+		if err := cmdDirect.Run(); err != nil {
+			return nil, fmt.Errorf("dnf repoquery (目标包查询) 失败: %v\n  stderr: %s", err, stderrDirect.String())
 		}
 
-		for _, line := range strings.Split(out.String(), "\n") {
+		for _, line := range strings.Split(outDirect.String(), "\n") {
 			line = strings.TrimSpace(line)
 			if isPackageURL(line) {
 				allURLs[line] = true
 			}
 		}
 
-		// 查询目标包本身
-		args2 := []string{
-			"repoquery", "--location",
+		// 2. 查询依赖树的下载 URL
+		argsDeps := []string{
+			"--noplugins",
 			"--setopt=reposdir=" + tmpReposDir,
+			"--setopt=cachedir=" + tmpCacheDir,
+			"--setopt=keepcache=1",
+			"repoquery", "--location", "--resolve", "--requires", "--recursive",
 			"--disablerepo=*",
 			"--releasever=" + releaseVer,
 		}
 		for _, id := range repoIDs {
-			args2 = append(args2, "--enablerepo="+id)
+			argsDeps = append(argsDeps, "--enablerepo="+id)
 		}
-		args2 = append(args2, targetPackages...)
+		argsDeps = append(argsDeps, targetPackages...)
 
-		cmd2 := exec.Command(m.cmdPath, args2...)
-		var out2 bytes.Buffer
-		cmd2.Stdout = &out2
-		if err := cmd2.Run(); err == nil {
-			for _, line := range strings.Split(out2.String(), "\n") {
+		cmdDeps := exec.Command(m.cmdPath, argsDeps...)
+		var outDeps, stderrDeps bytes.Buffer
+		cmdDeps.Stdout = &outDeps
+		cmdDeps.Stderr = &stderrDeps
+
+		if err := cmdDeps.Run(); err == nil {
+			for _, line := range strings.Split(outDeps.String(), "\n") {
 				line = strings.TrimSpace(line)
 				if isPackageURL(line) {
 					allURLs[line] = true
 				}
 			}
+		} else {
+			// 如果查依赖失败，打印警告但不直接中断，已包含目标包本身
+			fmt.Printf("[plan] 警告: 递归依赖查询返回: %v, stderr: %s\n", err, firstLines(stderrDeps.String(), 3))
 		}
 	} else {
 		// 传统 YUM repoquery
@@ -384,6 +400,7 @@ func (m *YUMManager) queryWithLocalRepos(metaDir string, isDnf bool, targetPacka
 			return nil, fmt.Errorf("未找到 repoquery 命令")
 		}
 		args := []string{
+			"--plugins=0",
 			"--resolve", "--requires", "--recursive", "--location",
 			"--setopt=reposdir=" + tmpReposDir,
 		}
@@ -393,7 +410,7 @@ func (m *YUMManager) queryWithLocalRepos(metaDir string, isDnf bool, targetPacka
 		cmd.Stdout = &out
 		cmd.Stderr = &stderr
 		if err := cmd.Run(); err != nil {
-			return nil, fmt.Errorf("repoquery (离线) 失败: %v\n  stderr: %s", err, firstLines(stderr.String(), 5))
+			return nil, fmt.Errorf("repoquery (离线) 失败: %v\n  stderr: %s", err, stderr.String())
 		}
 		for _, line := range strings.Split(out.String(), "\n") {
 			line = strings.TrimSpace(line)
