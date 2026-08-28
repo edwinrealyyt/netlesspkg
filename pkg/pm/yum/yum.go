@@ -342,44 +342,21 @@ func (m *YUMManager) queryWithLocalRepos(metaDir string, isDnf bool, targetPacka
 		tmpCacheDir := filepath.Join(tmpReposDir, "cache")
 		os.MkdirAll(tmpCacheDir, 0755)
 
-		// 1. 查询目标包本身的下载 URL
-		argsDirect := []string{
-			"--noplugins",
-			"--setopt=reposdir=" + tmpReposDir,
-			"--setopt=cachedir=" + tmpCacheDir,
-			"--setopt=keepcache=1",
-			"repoquery", "--location", "--latest-limit=1",
-			"--disablerepo=*",
-			"--releasever=" + releaseVer,
-		}
-		for _, id := range repoIDs {
-			argsDirect = append(argsDirect, "--enablerepo="+id)
-		}
-		argsDirect = append(argsDirect, targetPackages...)
-
-		cmdDirect := exec.Command(m.cmdPath, argsDirect...)
-		var outDirect, stderrDirect bytes.Buffer
-		cmdDirect.Stdout = &outDirect
-		cmdDirect.Stderr = &stderrDirect
-
-		if err := cmdDirect.Run(); err != nil {
-			return nil, fmt.Errorf("dnf repoquery (目标包查询) 失败: %v\n  stderr: %s", err, stderrDirect.String())
+		// 1. 获取所有需要的目标包及递归依赖包名集合
+		allPkgNames := make(map[string]bool)
+		for _, pkg := range targetPackages {
+			allPkgNames[pkg] = true
 		}
 
-		for _, line := range strings.Split(outDirect.String(), "\n") {
-			line = strings.TrimSpace(line)
-			if isPackageURL(line) {
-				allURLs[line] = true
-			}
-		}
+		// 2. 第一阶段：通过 DNF 解析递归依赖包清单 (Pass 1: Resolve Dependency Tree)
+		fmt.Printf("[plan] 正在深度递归解析 %s 的全部底层依赖包...\n", strings.Join(targetPackages, ", "))
 
-		// 2. 查询依赖树的下载 URL
 		argsDeps := []string{
 			"--noplugins",
 			"--setopt=reposdir=" + tmpReposDir,
 			"--setopt=cachedir=" + tmpCacheDir,
 			"--setopt=keepcache=1",
-			"repoquery", "--location", "--resolve", "--requires", "--recursive", "--latest-limit=1",
+			"repoquery", "--resolve", "--requires", "--recursive",
 			"--disablerepo=*",
 			"--releasever=" + releaseVer,
 		}
@@ -396,34 +373,153 @@ func (m *YUMManager) queryWithLocalRepos(metaDir string, isDnf bool, targetPacka
 		if err := cmdDeps.Run(); err == nil {
 			for _, line := range strings.Split(outDeps.String(), "\n") {
 				line = strings.TrimSpace(line)
+				if line != "" && !strings.HasPrefix(line, "#") && !strings.Contains(line, " ") {
+					allPkgNames[line] = true
+				}
+			}
+		} else {
+			// 如果 --resolve --requires 失败，尝试使用 --deplist 提取 provider 包名
+			argsDeplist := []string{
+				"--noplugins",
+				"--setopt=reposdir=" + tmpReposDir,
+				"--setopt=cachedir=" + tmpCacheDir,
+				"repoquery", "--deplist",
+				"--disablerepo=*",
+				"--releasever=" + releaseVer,
+			}
+			for _, id := range repoIDs {
+				argsDeplist = append(argsDeplist, "--enablerepo="+id)
+			}
+			argsDeplist = append(argsDeplist, targetPackages...)
+			cmdDeplist := exec.Command(m.cmdPath, argsDeplist...)
+			var outDeplist bytes.Buffer
+			cmdDeplist.Stdout = &outDeplist
+			if err := cmdDeplist.Run(); err == nil {
+				for _, line := range strings.Split(outDeplist.String(), "\n") {
+					line = strings.TrimSpace(line)
+					if strings.HasPrefix(line, "provider:") {
+						parts := strings.Fields(line)
+						if len(parts) >= 2 {
+							allPkgNames[parts[1]] = true
+						}
+					}
+				}
+			}
+		}
+
+		// 3. 第二阶段：根据完整包名清单查询所有 RPM 文件的真实下载 URL (Pass 2: Query Download URLs)
+		pkgList := make([]string, 0, len(allPkgNames))
+		for p := range allPkgNames {
+			pkgList = append(pkgList, p)
+		}
+		fmt.Printf("[plan] 依赖解析完成，共需下载 %d 个软件包（含目标包及其全部依赖）\n", len(pkgList))
+
+		argsURLs := []string{
+			"--noplugins",
+			"--setopt=reposdir=" + tmpReposDir,
+			"--setopt=cachedir=" + tmpCacheDir,
+			"--setopt=keepcache=1",
+			"repoquery", "--location", "--latest-limit=1",
+			"--disablerepo=*",
+			"--releasever=" + releaseVer,
+		}
+		for _, id := range repoIDs {
+			argsURLs = append(argsURLs, "--enablerepo="+id)
+		}
+		argsURLs = append(argsURLs, pkgList...)
+
+		cmdURLs := exec.Command(m.cmdPath, argsURLs...)
+		var outURLs, stderrURLs bytes.Buffer
+		cmdURLs.Stdout = &outURLs
+		cmdURLs.Stderr = &stderrURLs
+
+		if err := cmdURLs.Run(); err != nil {
+			return nil, fmt.Errorf("dnf repoquery (下载链接查询) 失败: %v\n  stderr: %s", err, stderrURLs.String())
+		}
+
+		for _, line := range strings.Split(outURLs.String(), "\n") {
+			line = strings.TrimSpace(line)
+			if isPackageURL(line) {
+				allURLs[line] = true
+			}
+		}
+
+		// 4. 补充阶段：使用 dnf download --url --resolve 检查是否有遗漏
+		argsDownload := []string{
+			"--noplugins",
+			"--setopt=reposdir=" + tmpReposDir,
+			"--setopt=cachedir=" + tmpCacheDir,
+			"download", "--url", "--resolve",
+			"--disablerepo=*",
+			"--releasever=" + releaseVer,
+		}
+		for _, id := range repoIDs {
+			argsDownload = append(argsDownload, "--enablerepo="+id)
+		}
+		argsDownload = append(argsDownload, targetPackages...)
+
+		cmdDownload := exec.Command(m.cmdPath, argsDownload...)
+		var outDownload bytes.Buffer
+		cmdDownload.Stdout = &outDownload
+		if err := cmdDownload.Run(); err == nil {
+			for _, line := range strings.Split(outDownload.String(), "\n") {
+				line = strings.TrimSpace(line)
 				if isPackageURL(line) {
 					allURLs[line] = true
 				}
 			}
-		} else {
-			// 如果查依赖失败，打印警告但不直接中断，已包含目标包本身
-			fmt.Printf("[plan] 警告: 递归依赖查询返回: %v, stderr: %s\n", err, firstLines(stderrDeps.String(), 3))
 		}
 	} else {
-		// 传统 YUM repoquery
+		// 传统 YUM 递归查询依赖与 URL
 		repoqueryPath, err := exec.LookPath("repoquery")
 		if err != nil {
 			return nil, fmt.Errorf("未找到 repoquery 命令")
 		}
-		args := []string{
+
+		// 1. 获取依赖包
+		allPkgNames := make(map[string]bool)
+		for _, pkg := range targetPackages {
+			allPkgNames[pkg] = true
+		}
+
+		argsDeps := []string{
 			"--plugins=0",
-			"--resolve", "--requires", "--recursive", "--location", "--pkgnarrow=latest",
+			"--resolve", "--requires", "--recursive",
 			"--setopt=reposdir=" + tmpReposDir,
 		}
-		args = append(args, targetPackages...)
-		cmd := exec.Command(repoqueryPath, args...)
-		var out, stderr bytes.Buffer
-		cmd.Stdout = &out
-		cmd.Stderr = &stderr
-		if err := cmd.Run(); err != nil {
-			return nil, fmt.Errorf("repoquery (离线) 失败: %v\n  stderr: %s", err, stderr.String())
+		argsDeps = append(argsDeps, targetPackages...)
+		cmdDeps := exec.Command(repoqueryPath, argsDeps...)
+		var outDeps bytes.Buffer
+		cmdDeps.Stdout = &outDeps
+		if err := cmdDeps.Run(); err == nil {
+			for _, line := range strings.Split(outDeps.String(), "\n") {
+				line = strings.TrimSpace(line)
+				if line != "" {
+					allPkgNames[line] = true
+				}
+			}
 		}
-		for _, line := range strings.Split(out.String(), "\n") {
+
+		// 2. 批量查 URL
+		pkgList := make([]string, 0, len(allPkgNames))
+		for p := range allPkgNames {
+			pkgList = append(pkgList, p)
+		}
+
+		argsURLs := []string{
+			"--plugins=0",
+			"--location", "--pkgnarrow=latest",
+			"--setopt=reposdir=" + tmpReposDir,
+		}
+		argsURLs = append(argsURLs, pkgList...)
+		cmdURLs := exec.Command(repoqueryPath, argsURLs...)
+		var outURLs, stderrURLs bytes.Buffer
+		cmdURLs.Stdout = &outURLs
+		cmdURLs.Stderr = &stderrURLs
+		if err := cmdURLs.Run(); err != nil {
+			return nil, fmt.Errorf("repoquery (离线) 失败: %v\n  stderr: %s", err, stderrURLs.String())
+		}
+		for _, line := range strings.Split(outURLs.String(), "\n") {
 			line = strings.TrimSpace(line)
 			if isPackageURL(line) {
 				allURLs[line] = true
