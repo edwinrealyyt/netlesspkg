@@ -143,7 +143,7 @@ func (m *YUMManager) GetMetadataURLs() ([]core.MetaFile, error) {
 			}
 		}
 
-		for _, repo := range repos {
+		for repoID, repo := range repos {
 			if !repo.enabled {
 				continue
 			}
@@ -158,18 +158,13 @@ func (m *YUMManager) GetMetadataURLs() ([]core.MetaFile, error) {
 					baseURL += "/"
 				}
 				repomdURL := baseURL + "repodata/repomd.xml"
-				
-				parts := strings.SplitN(repomdURL, "://", 2)
-				var savePath string
-				if len(parts) == 2 {
-					savePath = strings.ReplaceAll(parts[1], "/", "_")
-				} else {
-					savePath = strings.ReplaceAll(repomdURL, "/", "_")
-				}
-				
+
+				// 使用目录结构化的 save_path: {repo_id}/repodata/repomd.xml
 				metaFiles = append(metaFiles, core.MetaFile{
 					URL:      repomdURL,
-					SavePath: savePath,
+					SavePath: repoID + "/repodata/repomd.xml",
+					RepoID:   repoID,
+					BaseURL:  baseURL,
 				})
 			}
 		}
@@ -183,31 +178,28 @@ func (m *YUMManager) InjectMetaAndPlan(metaDir string, targetPackages []string) 
 		return nil, nil
 	}
 
-	// plan 步骤在内网执行，内网机器已有 repo 配置和元数据缓存。
-	// 直接使用系统原生 dnf/yum 查询依赖即可，不需要创建沙盒 repo。
-	// metaDir 参数在 YUM 场景下暂不使用（系统缓存已足够）。
-
 	isDnf := strings.HasSuffix(m.cmdPath, "dnf")
 
 	var packages []core.PackageInfo
 	var err error
 	var lastErr error
 
-	if isDnf {
-		// 策略 1: dnf -C repoquery（仅使用本地缓存，不访问网络）
-		fmt.Println("[plan] 策略 1: 使用 dnf 本地缓存查询依赖...")
-		packages, err = m.dnfRepoquerySystem(true, targetPackages)
-		if err == nil && len(packages) > 0 {
-			return packages, nil
-		}
-		lastErr = err
-		if err != nil {
-			fmt.Printf("[plan] 策略 1 失败: %v\n", summarizeError(err))
-		}
+	// 策略 1: 使用从外网搬运回来的元数据构建本地离线 repo（推荐）
+	// metaDir 中的目录结构: {repo_id}/repodata/repomd.xml, primary.xml.gz, ...
+	fmt.Println("[plan] 策略 1: 使用搬运的离线元数据查询依赖...")
+	packages, err = m.queryWithLocalRepos(metaDir, isDnf, targetPackages)
+	if err == nil && len(packages) > 0 {
+		return packages, nil
+	}
+	lastErr = err
+	if err != nil {
+		fmt.Printf("[plan] 策略 1 失败: %v\n", summarizeError(err))
+	}
 
-		// 策略 2: dnf repoquery（允许刷新元数据，部分 repo 可能内网可达）
-		fmt.Println("[plan] 策略 2: 使用 dnf repoquery（允许网络刷新）...")
-		packages, err = m.dnfRepoquerySystem(false, targetPackages)
+	if isDnf {
+		// 策略 2: dnf -C repoquery（仅使用系统本地缓存）
+		fmt.Println("[plan] 策略 2: 使用 dnf 系统缓存查询依赖...")
+		packages, err = m.dnfRepoquerySystem(true, targetPackages)
 		if err == nil && len(packages) > 0 {
 			return packages, nil
 		}
@@ -216,16 +208,19 @@ func (m *YUMManager) InjectMetaAndPlan(metaDir string, targetPackages []string) 
 			fmt.Printf("[plan] 策略 2 失败: %v\n", summarizeError(err))
 		}
 
-		// 策略 3: dnf download --url --resolve
-		fmt.Println("[plan] 策略 3: 使用 dnf download --url --resolve...")
-		packages, err = m.dnfDownloadSystem(targetPackages)
+		// 策略 3: dnf repoquery（允许网络刷新）
+		fmt.Println("[plan] 策略 3: 使用 dnf repoquery（允许网络刷新）...")
+		packages, err = m.dnfRepoquerySystem(false, targetPackages)
 		if err == nil && len(packages) > 0 {
 			return packages, nil
 		}
 		lastErr = err
+		if err != nil {
+			fmt.Printf("[plan] 策略 3 失败: %v\n", summarizeError(err))
+		}
 	} else {
 		// 传统 YUM: repoquery
-		fmt.Println("[plan] 使用 repoquery 查询依赖...")
+		fmt.Println("[plan] 策略 2: 使用 repoquery 查询依赖...")
 		packages, err = m.yumRepoquerySystem(targetPackages)
 		if err == nil && len(packages) > 0 {
 			return packages, nil
@@ -243,7 +238,143 @@ func (m *YUMManager) InjectMetaAndPlan(metaDir string, targetPackages []string) 
 	return nil, fmt.Errorf("未找到任何需要下载的包")
 }
 
-// dnfRepoquerySystem 使用系统原生 dnf repoquery 查询包及依赖的下载 URL
+// queryWithLocalRepos 使用从外网搬运回来的元数据创建本地离线 repo 进行依赖查询
+// metaDir 的目录结构应为: {repo_id}/repodata/repomd.xml, primary.xml.gz, ...
+func (m *YUMManager) queryWithLocalRepos(metaDir string, isDnf bool, targetPackages []string) ([]core.PackageInfo, error) {
+	// 扫描 metaDir 下的子目录，每个子目录视为一个 repo
+	entries, err := os.ReadDir(metaDir)
+	if err != nil {
+		return nil, fmt.Errorf("读取元数据目录失败: %v", err)
+	}
+
+	var repoIDs []string
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		repoDataDir := filepath.Join(metaDir, entry.Name(), "repodata")
+		if _, err := os.Stat(filepath.Join(repoDataDir, "repomd.xml")); err == nil {
+			repoIDs = append(repoIDs, entry.Name())
+		}
+	}
+
+	if len(repoIDs) == 0 {
+		return nil, fmt.Errorf("元数据目录中未找到任何有效的 repo 结构 (需要 {repo_id}/repodata/repomd.xml)")
+	}
+
+	// 创建临时 repos.d 目录，为每个 repo 生成 .repo 配置
+	tmpReposDir, err := os.MkdirTemp("", "netlesspkg-repos-*")
+	if err != nil {
+		return nil, fmt.Errorf("创建临时目录失败: %v", err)
+	}
+	defer os.RemoveAll(tmpReposDir)
+
+	var repoConfigs []string
+	for _, repoID := range repoIDs {
+		repoPath := filepath.Join(metaDir, repoID)
+		absPath, _ := filepath.Abs(repoPath)
+		config := fmt.Sprintf("[%s]\nname=Offline %s\nbaseurl=file://%s/\nenabled=1\ngpgcheck=0\n\n",
+			repoID, repoID, strings.ReplaceAll(absPath, "\\", "/"))
+		repoConfigs = append(repoConfigs, config)
+	}
+
+	repoFile := filepath.Join(tmpReposDir, "offline.repo")
+	err = os.WriteFile(repoFile, []byte(strings.Join(repoConfigs, "")), 0644)
+	if err != nil {
+		return nil, fmt.Errorf("写入临时 repo 配置失败: %v", err)
+	}
+
+	fmt.Printf("[plan] 已加载 %d 个离线仓库: %s\n", len(repoIDs), strings.Join(repoIDs, ", "))
+
+	// 使用 dnf/yum 查询
+	allURLs := make(map[string]bool)
+
+	if isDnf {
+		releaseVer := getReleaseVer()
+		// 查询目标包及依赖
+		args := []string{
+			"repoquery", "--location", "--resolve", "--requires", "--recursive",
+			"--setopt=reposdir=" + tmpReposDir,
+			"--disablerepo=*",
+			"--releasever=" + releaseVer,
+		}
+		for _, id := range repoIDs {
+			args = append(args, "--enablerepo="+id)
+		}
+		args = append(args, targetPackages...)
+
+		cmd := exec.Command(m.cmdPath, args...)
+		var out, stderr bytes.Buffer
+		cmd.Stdout = &out
+		cmd.Stderr = &stderr
+
+		if err := cmd.Run(); err != nil {
+			return nil, fmt.Errorf("dnf repoquery (离线) 失败: %v\n  stderr: %s", err, firstLines(stderr.String(), 5))
+		}
+
+		for _, line := range strings.Split(out.String(), "\n") {
+			line = strings.TrimSpace(line)
+			if isPackageURL(line) {
+				allURLs[line] = true
+			}
+		}
+
+		// 查询目标包本身
+		args2 := []string{
+			"repoquery", "--location",
+			"--setopt=reposdir=" + tmpReposDir,
+			"--disablerepo=*",
+			"--releasever=" + releaseVer,
+		}
+		for _, id := range repoIDs {
+			args2 = append(args2, "--enablerepo="+id)
+		}
+		args2 = append(args2, targetPackages...)
+
+		cmd2 := exec.Command(m.cmdPath, args2...)
+		var out2 bytes.Buffer
+		cmd2.Stdout = &out2
+		if err := cmd2.Run(); err == nil {
+			for _, line := range strings.Split(out2.String(), "\n") {
+				line = strings.TrimSpace(line)
+				if isPackageURL(line) {
+					allURLs[line] = true
+				}
+			}
+		}
+	} else {
+		// 传统 YUM repoquery
+		repoqueryPath, err := exec.LookPath("repoquery")
+		if err != nil {
+			return nil, fmt.Errorf("未找到 repoquery 命令")
+		}
+		args := []string{
+			"--resolve", "--requires", "--recursive", "--location",
+			"--setopt=reposdir=" + tmpReposDir,
+		}
+		args = append(args, targetPackages...)
+		cmd := exec.Command(repoqueryPath, args...)
+		var out, stderr bytes.Buffer
+		cmd.Stdout = &out
+		cmd.Stderr = &stderr
+		if err := cmd.Run(); err != nil {
+			return nil, fmt.Errorf("repoquery (离线) 失败: %v\n  stderr: %s", err, firstLines(stderr.String(), 5))
+		}
+		for _, line := range strings.Split(out.String(), "\n") {
+			line = strings.TrimSpace(line)
+			if isPackageURL(line) {
+				allURLs[line] = true
+			}
+		}
+	}
+
+	if len(allURLs) == 0 {
+		return nil, fmt.Errorf("离线元数据中未查询到包 URL（可能元数据不完整，请确认 sync-meta 步骤已下载全部元数据）")
+	}
+
+	return urlsToPackages(allURLs), nil
+}
+
 // cacheOnly: 如果为 true 则使用 -C 仅查本地缓存
 func (m *YUMManager) dnfRepoquerySystem(cacheOnly bool, targetPackages []string) ([]core.PackageInfo, error) {
 	allURLs := make(map[string]bool)

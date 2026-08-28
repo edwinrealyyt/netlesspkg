@@ -3,8 +3,10 @@ package core
 
 // MetaFile 表示一个需要下载的元数据文件。
 type MetaFile struct {
-	URL      string `json:"url"`       // 外网下载地址
-	SavePath string `json:"save_path"` // 注入到内网时，相对于缓存根目录的路径
+	URL      string `json:"url"`                 // 外网下载地址
+	SavePath string `json:"save_path"`           // 注入到内网时，相对于缓存根目录的路径
+	RepoID   string `json:"repo_id,omitempty"`   // YUM repo ID（仅 RHEL 系使用）
+	BaseURL  string `json:"base_url,omitempty"`  // YUM repo 的 baseurl（用于构建附加元数据 URL）
 }
 
 // MetaRequest 表示 export 阶段的输出 (meta_request.json)。
