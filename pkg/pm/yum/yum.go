@@ -179,6 +179,10 @@ func (m *YUMManager) GetMetadataURLs() ([]core.MetaFile, error) {
 }
 
 func (m *YUMManager) InjectMetaAndPlan(metaDir string, targetPackages []string) ([]core.PackageInfo, error) {
+	if len(targetPackages) == 0 {
+		return nil, nil
+	}
+
 	sandbox := filepath.Join(metaDir, "sandbox")
 	err := os.MkdirAll(sandbox, 0755)
 	if err != nil {
@@ -192,6 +196,7 @@ func (m *YUMManager) InjectMetaAndPlan(metaDir string, targetPackages []string) 
 		return nil, fmt.Errorf("创建仓库配置目录失败: %v", err)
 	}
 
+	// 创建临时 repo 配置指向元数据目录
 	repoFile := filepath.Join(reposDir, "local.repo")
 	repoContent := fmt.Sprintf("[local-meta]\nname=Local Meta\nbaseurl=file://%s/\nenabled=1\ngpgcheck=0\n", strings.ReplaceAll(metaDir, "\\", "/"))
 	err = os.WriteFile(repoFile, []byte(repoContent), 0644)
@@ -200,61 +205,168 @@ func (m *YUMManager) InjectMetaAndPlan(metaDir string, targetPackages []string) 
 	}
 
 	releaseVer := getReleaseVer()
-	var args []string
-	if strings.HasSuffix(m.cmdPath, "dnf") {
-		args = []string{
-			"install", "--resolve", "--urls", "--installroot=" + sandbox,
-			"--releasever=" + releaseVer, "--setopt=reposdir=" + reposDir,
-			"--setopt=cachedir=" + filepath.Join(sandbox, "cache"),
+	isDnf := strings.HasSuffix(m.cmdPath, "dnf")
+
+	// 尝试多种策略获取包下载 URL
+	var packages []core.PackageInfo
+
+	if isDnf {
+		// 策略 1: dnf repoquery --location（获取包本身及其依赖的下载 URL）
+		packages, err = m.dnfRepoquery(sandbox, reposDir, releaseVer, targetPackages)
+		if err != nil {
+			// 策略 2: dnf download --resolve --url（部分 dnf 版本支持）
+			packages, err = m.dnfDownloadURLs(sandbox, reposDir, releaseVer, targetPackages)
 		}
-		args = append(args, targetPackages...)
 	} else {
-		args = []string{
-			"repoquery", "--resolve", "--requires", "--recursive", "--location",
-			"--installroot=" + sandbox,
-			"--setopt=reposdir=" + reposDir,
-		}
-		args = append(args, targetPackages...)
+		// YUM: 使用 repoquery
+		packages, err = m.yumRepoquery(sandbox, reposDir, targetPackages)
 	}
 
-	var cmd *exec.Cmd
-	if strings.HasSuffix(m.cmdPath, "dnf") {
-		cmd = exec.Command(m.cmdPath, args...)
-	} else {
-		repoqueryPath, err := exec.LookPath("repoquery")
-		if err != nil {
-			return nil, fmt.Errorf("未找到 repoquery 命令")
-		}
-		cmd = exec.Command(repoqueryPath, args...)
+	return packages, err
+}
+
+// dnfRepoquery 使用 dnf repoquery 获取包及依赖的下载 URL
+func (m *YUMManager) dnfRepoquery(sandbox, reposDir, releaseVer string, targetPackages []string) ([]core.PackageInfo, error) {
+	// 先获取目标包自身的 URL
+	allURLs := make(map[string]bool)
+
+	// 获取目标包及其所有依赖的 URL
+	args := []string{
+		"repoquery", "--location", "--resolve", "--requires", "--recursive",
+		"--installroot=" + sandbox,
+		"--releasever=" + releaseVer,
+		"--setopt=reposdir=" + reposDir,
+		"--disablerepo=*", "--enablerepo=local-meta",
 	}
-	
-	var out bytes.Buffer
-	var stderr bytes.Buffer
+	args = append(args, targetPackages...)
+
+	cmd := exec.Command(m.cmdPath, args...)
+	var out, stderr bytes.Buffer
+	cmd.Stdout = &out
+	cmd.Stderr = &stderr
+
+	err := cmd.Run()
+	if err != nil {
+		return nil, fmt.Errorf("dnf repoquery (依赖) 失败: %v\n  stderr: %s", err, stderr.String())
+	}
+
+	for _, line := range strings.Split(out.String(), "\n") {
+		line = strings.TrimSpace(line)
+		if isPackageURL(line) {
+			allURLs[line] = true
+		}
+	}
+
+	// 再获取目标包本身的 URL
+	args2 := []string{
+		"repoquery", "--location",
+		"--installroot=" + sandbox,
+		"--releasever=" + releaseVer,
+		"--setopt=reposdir=" + reposDir,
+		"--disablerepo=*", "--enablerepo=local-meta",
+	}
+	args2 = append(args2, targetPackages...)
+
+	cmd2 := exec.Command(m.cmdPath, args2...)
+	var out2, stderr2 bytes.Buffer
+	cmd2.Stdout = &out2
+	cmd2.Stderr = &stderr2
+
+	if err := cmd2.Run(); err == nil {
+		for _, line := range strings.Split(out2.String(), "\n") {
+			line = strings.TrimSpace(line)
+			if isPackageURL(line) {
+				allURLs[line] = true
+			}
+		}
+	}
+
+	return urlsToPackages(allURLs), nil
+}
+
+// dnfDownloadURLs 使用 dnf download --url --resolve 作为备选方案
+func (m *YUMManager) dnfDownloadURLs(sandbox, reposDir, releaseVer string, targetPackages []string) ([]core.PackageInfo, error) {
+	args := []string{
+		"download", "--url", "--resolve",
+		"--installroot=" + sandbox,
+		"--releasever=" + releaseVer,
+		"--setopt=reposdir=" + reposDir,
+		"--disablerepo=*", "--enablerepo=local-meta",
+	}
+	args = append(args, targetPackages...)
+
+	cmd := exec.Command(m.cmdPath, args...)
+	var out, stderr bytes.Buffer
+	cmd.Stdout = &out
+	cmd.Stderr = &stderr
+
+	err := cmd.Run()
+	if err != nil {
+		return nil, fmt.Errorf("dnf download --url 失败: %v\n  stderr: %s\n排障提示:\n  1. 请确认 dnf 版本支持 download 子命令\n  2. 尝试手动运行: dnf download --url --resolve <包名>", err, stderr.String())
+	}
+
+	allURLs := make(map[string]bool)
+	for _, line := range strings.Split(out.String(), "\n") {
+		line = strings.TrimSpace(line)
+		if isPackageURL(line) {
+			allURLs[line] = true
+		}
+	}
+
+	return urlsToPackages(allURLs), nil
+}
+
+// yumRepoquery 使用 repoquery 命令（适用于传统 YUM）
+func (m *YUMManager) yumRepoquery(sandbox, reposDir string, targetPackages []string) ([]core.PackageInfo, error) {
+	repoqueryPath, err := exec.LookPath("repoquery")
+	if err != nil {
+		return nil, fmt.Errorf("未找到 repoquery 命令\n排障提示: 请安装 yum-utils 包 (yum install -y yum-utils)")
+	}
+
+	args := []string{
+		"--resolve", "--requires", "--recursive", "--location",
+		"--installroot=" + sandbox,
+		"--setopt=reposdir=" + reposDir,
+	}
+	args = append(args, targetPackages...)
+
+	cmd := exec.Command(repoqueryPath, args...)
+	var out, stderr bytes.Buffer
 	cmd.Stdout = &out
 	cmd.Stderr = &stderr
 
 	err = cmd.Run()
 	if err != nil {
-		return nil, fmt.Errorf("解析包依赖失败: %v, stderr: %s", err, stderr.String())
+		return nil, fmt.Errorf("repoquery 失败: %v\n  stderr: %s", err, stderr.String())
 	}
 
-	lines := strings.Split(out.String(), "\n")
-	var packages []core.PackageInfo
-	for _, line := range lines {
+	allURLs := make(map[string]bool)
+	for _, line := range strings.Split(out.String(), "\n") {
 		line = strings.TrimSpace(line)
-		if line == "" {
-			continue
-		}
-		if strings.HasPrefix(line, "http://") || strings.HasPrefix(line, "https://") || strings.HasPrefix(line, "file://") {
-			filename := filepath.Base(line)
-			packages = append(packages, core.PackageInfo{
-				URL:      line,
-				Filename: filename,
-			})
+		if isPackageURL(line) {
+			allURLs[line] = true
 		}
 	}
 
-	return packages, nil
+	return urlsToPackages(allURLs), nil
+}
+
+// isPackageURL 判断是否为有效的包下载 URL
+func isPackageURL(s string) bool {
+	return strings.HasPrefix(s, "http://") || strings.HasPrefix(s, "https://") || strings.HasPrefix(s, "file://")
+}
+
+// urlsToPackages 将 URL 集合转换为 PackageInfo 列表
+func urlsToPackages(urls map[string]bool) []core.PackageInfo {
+	var packages []core.PackageInfo
+	for url := range urls {
+		filename := filepath.Base(url)
+		packages = append(packages, core.PackageInfo{
+			URL:      url,
+			Filename: filename,
+		})
+	}
+	return packages
 }
 
 func (m *YUMManager) InjectPackagesAndInstall(pkgDir string, targetPackages []string) error {
