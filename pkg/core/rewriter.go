@@ -67,6 +67,14 @@ func (rw *URLRewriter) RewriteURL(rawURL string) (string, bool, string) {
 
 // CheckInternalURLError 检查失败的 URL 是否可能是内网专用源导致的，若是则生成排障提示
 func CheckInternalURLError(urlStr string) string {
+	if strings.HasPrefix(urlStr, "file://") {
+		return "排障建议：检测到该下载计划中包含本地文件路径 (file://...)。\n" +
+			"这是因为使用了旧版 netlesspkg plan 生成的计划文件。\n" +
+			"解决方案：\n" +
+			"  1. [推荐] 使用最新版本 netlesspkg plan 重新生成包含真实 HTTP URL 的 download_plan.json\n" +
+			"  2. 或在当前 fetch 命令中添加 --replace 参数将 file:// 前缀替换为公网镜像地址"
+	}
+
 	for internalDomain, publicDomain := range DefaultDomainMappings {
 		if strings.Contains(urlStr, internalDomain) {
 			return fmt.Sprintf("排障建议：检测到该 URL 使用了云厂商内网专用源 [%s]，外网环境无法直接解析/访问。\n"+

@@ -90,16 +90,17 @@ type repoConfig struct {
 	mirrorlist string
 }
 
-func (m *YUMManager) GetMetadataURLs() ([]core.MetaFile, error) {
+// loadSystemRepoBaseURLs 解析 /etc/yum.repos.d/*.repo，获取所有已启用的 repo_id -> baseurl 映射
+func loadSystemRepoBaseURLs() map[string]string {
 	releaseVer := getReleaseVer()
 	baseArch := getBaseArch()
 
 	files, err := filepath.Glob("/etc/yum.repos.d/*.repo")
 	if err != nil {
-		return nil, fmt.Errorf("读取 /etc/yum.repos.d/ 失败: %v", err)
+		return make(map[string]string)
 	}
 
-	var metaFiles []core.MetaFile
+	repoURLs := make(map[string]string)
 	for _, file := range files {
 		content, err := os.ReadFile(file)
 		if err != nil {
@@ -157,17 +158,27 @@ func (m *YUMManager) GetMetadataURLs() ([]core.MetaFile, error) {
 				if !strings.HasSuffix(baseURL, "/") {
 					baseURL += "/"
 				}
-				repomdURL := baseURL + "repodata/repomd.xml"
-
-				// 使用目录结构化的 save_path: {repo_id}/repodata/repomd.xml
-				metaFiles = append(metaFiles, core.MetaFile{
-					URL:      repomdURL,
-					SavePath: repoID + "/repodata/repomd.xml",
-					RepoID:   repoID,
-					BaseURL:  baseURL,
-				})
+				repoURLs[repoID] = baseURL
 			}
 		}
+	}
+
+	return repoURLs
+}
+
+func (m *YUMManager) GetMetadataURLs() ([]core.MetaFile, error) {
+	repoURLs := loadSystemRepoBaseURLs()
+	var metaFiles []core.MetaFile
+
+	for repoID, baseURL := range repoURLs {
+		repomdURL := baseURL + "repodata/repomd.xml"
+
+		metaFiles = append(metaFiles, core.MetaFile{
+			URL:      repomdURL,
+			SavePath: repoID + "/repodata/repomd.xml",
+			RepoID:   repoID,
+			BaseURL:  baseURL,
+		})
 	}
 
 	return metaFiles, nil
@@ -424,7 +435,8 @@ func (m *YUMManager) queryWithLocalRepos(metaDir string, isDnf bool, targetPacka
 		return nil, fmt.Errorf("离线元数据中未查询到包 URL（可能元数据不完整，请确认 sync-meta 步骤已下载全部元数据）")
 	}
 
-	return urlsToPackages(allURLs), nil
+	repoBaseURLs := loadSystemRepoBaseURLs()
+	return restoreRemoteURLs(allURLs, repoBaseURLs, metaDir), nil
 }
 
 // cacheOnly: 如果为 true 则使用 -C 仅查本地缓存
@@ -542,6 +554,59 @@ func (m *YUMManager) yumRepoquerySystem(targetPackages []string) ([]core.Package
 // isPackageURL 判断是否为有效的包下载 URL
 func isPackageURL(s string) bool {
 	return strings.HasPrefix(s, "http://") || strings.HasPrefix(s, "https://") || strings.HasPrefix(s, "file://")
+}
+
+// restoreRemoteURLs 将 DNF/YUM 返回的 local file:// URL 还原为外网可下载的真实 HTTP/HTTPS 镜像 URL
+func restoreRemoteURLs(urls map[string]bool, repoBaseURLs map[string]string, metaDir string) []core.PackageInfo {
+	var packages []core.PackageInfo
+
+	for rawURL := range urls {
+		finalURL := rawURL
+		filename := filepath.Base(rawURL)
+
+		if strings.HasPrefix(rawURL, "file://") {
+			cleanPath := strings.TrimPrefix(rawURL, "file://")
+			cleanPath = strings.ReplaceAll(cleanPath, "\\", "/")
+
+			matched := false
+			// 1. 精确匹配 repo_id
+			for repoID, baseURL := range repoBaseURLs {
+				pattern := "/" + repoID + "/"
+				if idx := strings.Index(cleanPath, pattern); idx != -1 {
+					subPath := cleanPath[idx+len(pattern):]
+					if !strings.HasSuffix(baseURL, "/") {
+						baseURL += "/"
+					}
+					finalURL = baseURL + strings.TrimPrefix(subPath, "/")
+					matched = true
+					break
+				}
+			}
+
+			// 2. 模糊匹配 (如果 repo_id 包含在路径中)
+			if !matched {
+				for repoID, baseURL := range repoBaseURLs {
+					if strings.Contains(cleanPath, repoID) {
+						idx := strings.Index(cleanPath, repoID)
+						subPath := cleanPath[idx+len(repoID):]
+						if !strings.HasSuffix(baseURL, "/") {
+							baseURL += "/"
+						}
+						finalURL = baseURL + strings.TrimPrefix(subPath, "/")
+						matched = true
+						break
+					}
+				}
+			}
+		}
+
+		packages = append(packages, core.PackageInfo{
+			URL:      finalURL,
+			Filename: filename,
+		})
+	}
+
+	return packages
 }
 
 // urlsToPackages 将 URL 集合转换为 PackageInfo 列表
