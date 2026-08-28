@@ -183,60 +183,75 @@ func (m *YUMManager) InjectMetaAndPlan(metaDir string, targetPackages []string) 
 		return nil, nil
 	}
 
-	sandbox := filepath.Join(metaDir, "sandbox")
-	err := os.MkdirAll(sandbox, 0755)
-	if err != nil {
-		return nil, fmt.Errorf("创建沙盒目录失败: %v", err)
-	}
-	defer os.RemoveAll(sandbox) // 清理沙盒
+	// plan 步骤在内网执行，内网机器已有 repo 配置和元数据缓存。
+	// 直接使用系统原生 dnf/yum 查询依赖即可，不需要创建沙盒 repo。
+	// metaDir 参数在 YUM 场景下暂不使用（系统缓存已足够）。
 
-	reposDir := filepath.Join(sandbox, "repos.d")
-	err = os.MkdirAll(reposDir, 0755)
-	if err != nil {
-		return nil, fmt.Errorf("创建仓库配置目录失败: %v", err)
-	}
-
-	// 创建临时 repo 配置指向元数据目录
-	repoFile := filepath.Join(reposDir, "local.repo")
-	repoContent := fmt.Sprintf("[local-meta]\nname=Local Meta\nbaseurl=file://%s/\nenabled=1\ngpgcheck=0\n", strings.ReplaceAll(metaDir, "\\", "/"))
-	err = os.WriteFile(repoFile, []byte(repoContent), 0644)
-	if err != nil {
-		return nil, fmt.Errorf("写入本地仓库配置失败: %v", err)
-	}
-
-	releaseVer := getReleaseVer()
 	isDnf := strings.HasSuffix(m.cmdPath, "dnf")
 
-	// 尝试多种策略获取包下载 URL
 	var packages []core.PackageInfo
+	var err error
+	var lastErr error
 
 	if isDnf {
-		// 策略 1: dnf repoquery --location（获取包本身及其依赖的下载 URL）
-		packages, err = m.dnfRepoquery(sandbox, reposDir, releaseVer, targetPackages)
-		if err != nil {
-			// 策略 2: dnf download --resolve --url（部分 dnf 版本支持）
-			packages, err = m.dnfDownloadURLs(sandbox, reposDir, releaseVer, targetPackages)
+		// 策略 1: dnf -C repoquery（仅使用本地缓存，不访问网络）
+		fmt.Println("[plan] 策略 1: 使用 dnf 本地缓存查询依赖...")
+		packages, err = m.dnfRepoquerySystem(true, targetPackages)
+		if err == nil && len(packages) > 0 {
+			return packages, nil
 		}
+		lastErr = err
+		if err != nil {
+			fmt.Printf("[plan] 策略 1 失败: %v\n", summarizeError(err))
+		}
+
+		// 策略 2: dnf repoquery（允许刷新元数据，部分 repo 可能内网可达）
+		fmt.Println("[plan] 策略 2: 使用 dnf repoquery（允许网络刷新）...")
+		packages, err = m.dnfRepoquerySystem(false, targetPackages)
+		if err == nil && len(packages) > 0 {
+			return packages, nil
+		}
+		lastErr = err
+		if err != nil {
+			fmt.Printf("[plan] 策略 2 失败: %v\n", summarizeError(err))
+		}
+
+		// 策略 3: dnf download --url --resolve
+		fmt.Println("[plan] 策略 3: 使用 dnf download --url --resolve...")
+		packages, err = m.dnfDownloadSystem(targetPackages)
+		if err == nil && len(packages) > 0 {
+			return packages, nil
+		}
+		lastErr = err
 	} else {
-		// YUM: 使用 repoquery
-		packages, err = m.yumRepoquery(sandbox, reposDir, targetPackages)
+		// 传统 YUM: repoquery
+		fmt.Println("[plan] 使用 repoquery 查询依赖...")
+		packages, err = m.yumRepoquerySystem(targetPackages)
+		if err == nil && len(packages) > 0 {
+			return packages, nil
+		}
+		lastErr = err
 	}
 
-	return packages, err
+	if lastErr != nil {
+		return nil, fmt.Errorf("所有依赖解析策略均失败\n最后一次错误: %v\n\n排障提示:\n"+
+			"  1. 请确认系统 dnf/yum 元数据缓存存在: 尝试运行 dnf makecache 或 yum makecache\n"+
+			"  2. 如果内网完全无法连接任何镜像源，请先在可达环境执行 dnf makecache 建立缓存\n"+
+			"  3. 检查 /etc/yum.repos.d/ 下是否有可用的 repo 配置", lastErr)
+	}
+
+	return nil, fmt.Errorf("未找到任何需要下载的包")
 }
 
-// dnfRepoquery 使用 dnf repoquery 获取包及依赖的下载 URL
-func (m *YUMManager) dnfRepoquery(sandbox, reposDir, releaseVer string, targetPackages []string) ([]core.PackageInfo, error) {
-	// 先获取目标包自身的 URL
+// dnfRepoquerySystem 使用系统原生 dnf repoquery 查询包及依赖的下载 URL
+// cacheOnly: 如果为 true 则使用 -C 仅查本地缓存
+func (m *YUMManager) dnfRepoquerySystem(cacheOnly bool, targetPackages []string) ([]core.PackageInfo, error) {
 	allURLs := make(map[string]bool)
 
-	// 获取目标包及其所有依赖的 URL
-	args := []string{
-		"repoquery", "--location", "--resolve", "--requires", "--recursive",
-		"--installroot=" + sandbox,
-		"--releasever=" + releaseVer,
-		"--setopt=reposdir=" + reposDir,
-		"--disablerepo=*", "--enablerepo=local-meta",
+	// 查询依赖的 URL
+	args := []string{"repoquery", "--location", "--resolve", "--requires", "--recursive"}
+	if cacheOnly {
+		args = append(args, "-C", "--setopt=metadata_expire=-1")
 	}
 	args = append(args, targetPackages...)
 
@@ -247,7 +262,7 @@ func (m *YUMManager) dnfRepoquery(sandbox, reposDir, releaseVer string, targetPa
 
 	err := cmd.Run()
 	if err != nil {
-		return nil, fmt.Errorf("dnf repoquery (依赖) 失败: %v\n  stderr: %s", err, stderr.String())
+		return nil, fmt.Errorf("dnf repoquery --requires 失败: %v\n  stderr: %s", err, firstLines(stderr.String(), 5))
 	}
 
 	for _, line := range strings.Split(out.String(), "\n") {
@@ -257,20 +272,16 @@ func (m *YUMManager) dnfRepoquery(sandbox, reposDir, releaseVer string, targetPa
 		}
 	}
 
-	// 再获取目标包本身的 URL
-	args2 := []string{
-		"repoquery", "--location",
-		"--installroot=" + sandbox,
-		"--releasever=" + releaseVer,
-		"--setopt=reposdir=" + reposDir,
-		"--disablerepo=*", "--enablerepo=local-meta",
+	// 查询目标包本身的 URL
+	args2 := []string{"repoquery", "--location"}
+	if cacheOnly {
+		args2 = append(args2, "-C", "--setopt=metadata_expire=-1")
 	}
 	args2 = append(args2, targetPackages...)
 
 	cmd2 := exec.Command(m.cmdPath, args2...)
-	var out2, stderr2 bytes.Buffer
+	var out2 bytes.Buffer
 	cmd2.Stdout = &out2
-	cmd2.Stderr = &stderr2
 
 	if err := cmd2.Run(); err == nil {
 		for _, line := range strings.Split(out2.String(), "\n") {
@@ -281,18 +292,16 @@ func (m *YUMManager) dnfRepoquery(sandbox, reposDir, releaseVer string, targetPa
 		}
 	}
 
+	if len(allURLs) == 0 {
+		return nil, fmt.Errorf("未查询到任何包的下载 URL")
+	}
+
 	return urlsToPackages(allURLs), nil
 }
 
-// dnfDownloadURLs 使用 dnf download --url --resolve 作为备选方案
-func (m *YUMManager) dnfDownloadURLs(sandbox, reposDir, releaseVer string, targetPackages []string) ([]core.PackageInfo, error) {
-	args := []string{
-		"download", "--url", "--resolve",
-		"--installroot=" + sandbox,
-		"--releasever=" + releaseVer,
-		"--setopt=reposdir=" + reposDir,
-		"--disablerepo=*", "--enablerepo=local-meta",
-	}
+// dnfDownloadSystem 使用 dnf download --url --resolve 查询下载 URL
+func (m *YUMManager) dnfDownloadSystem(targetPackages []string) ([]core.PackageInfo, error) {
+	args := []string{"download", "--url", "--resolve"}
 	args = append(args, targetPackages...)
 
 	cmd := exec.Command(m.cmdPath, args...)
@@ -302,7 +311,7 @@ func (m *YUMManager) dnfDownloadURLs(sandbox, reposDir, releaseVer string, targe
 
 	err := cmd.Run()
 	if err != nil {
-		return nil, fmt.Errorf("dnf download --url 失败: %v\n  stderr: %s\n排障提示:\n  1. 请确认 dnf 版本支持 download 子命令\n  2. 尝试手动运行: dnf download --url --resolve <包名>", err, stderr.String())
+		return nil, fmt.Errorf("dnf download --url 失败: %v\n  stderr: %s", err, firstLines(stderr.String(), 5))
 	}
 
 	allURLs := make(map[string]bool)
@@ -316,18 +325,14 @@ func (m *YUMManager) dnfDownloadURLs(sandbox, reposDir, releaseVer string, targe
 	return urlsToPackages(allURLs), nil
 }
 
-// yumRepoquery 使用 repoquery 命令（适用于传统 YUM）
-func (m *YUMManager) yumRepoquery(sandbox, reposDir string, targetPackages []string) ([]core.PackageInfo, error) {
+// yumRepoquerySystem 使用系统原生 repoquery 查询
+func (m *YUMManager) yumRepoquerySystem(targetPackages []string) ([]core.PackageInfo, error) {
 	repoqueryPath, err := exec.LookPath("repoquery")
 	if err != nil {
 		return nil, fmt.Errorf("未找到 repoquery 命令\n排障提示: 请安装 yum-utils 包 (yum install -y yum-utils)")
 	}
 
-	args := []string{
-		"--resolve", "--requires", "--recursive", "--location",
-		"--installroot=" + sandbox,
-		"--setopt=reposdir=" + reposDir,
-	}
+	args := []string{"--resolve", "--requires", "--recursive", "--location"}
 	args = append(args, targetPackages...)
 
 	cmd := exec.Command(repoqueryPath, args...)
@@ -337,7 +342,7 @@ func (m *YUMManager) yumRepoquery(sandbox, reposDir string, targetPackages []str
 
 	err = cmd.Run()
 	if err != nil {
-		return nil, fmt.Errorf("repoquery 失败: %v\n  stderr: %s", err, stderr.String())
+		return nil, fmt.Errorf("repoquery 失败: %v\n  stderr: %s", err, firstLines(stderr.String(), 5))
 	}
 
 	allURLs := make(map[string]bool)
@@ -367,6 +372,24 @@ func urlsToPackages(urls map[string]bool) []core.PackageInfo {
 		})
 	}
 	return packages
+}
+
+// firstLines 取错误输出的前 N 行，避免超长输出
+func firstLines(s string, n int) string {
+	lines := strings.Split(s, "\n")
+	if len(lines) <= n {
+		return s
+	}
+	return strings.Join(lines[:n], "\n") + "\n  ..."
+}
+
+// summarizeError 取错误信息的第一行用于简短展示
+func summarizeError(err error) string {
+	s := err.Error()
+	if idx := strings.Index(s, "\n"); idx > 0 {
+		return s[:idx]
+	}
+	return s
 }
 
 func (m *YUMManager) InjectPackagesAndInstall(pkgDir string, targetPackages []string) error {
