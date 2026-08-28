@@ -239,27 +239,62 @@ func (m *YUMManager) InjectMetaAndPlan(metaDir string, targetPackages []string) 
 }
 
 // queryWithLocalRepos 使用从外网搬运回来的元数据创建本地离线 repo 进行依赖查询
-// metaDir 的目录结构应为: {repo_id}/repodata/repomd.xml, primary.xml.gz, ...
 func (m *YUMManager) queryWithLocalRepos(metaDir string, isDnf bool, targetPackages []string) ([]core.PackageInfo, error) {
-	// 扫描 metaDir 下的子目录，每个子目录视为一个 repo
+	// 1. 扫描并自动组织 repo 目录结构
+	repoIDs := make([]string, 0)
+
+	// 检查子目录结构
 	entries, err := os.ReadDir(metaDir)
 	if err != nil {
 		return nil, fmt.Errorf("读取元数据目录失败: %v", err)
 	}
 
-	var repoIDs []string
 	for _, entry := range entries {
-		if !entry.IsDir() {
-			continue
-		}
-		repoDataDir := filepath.Join(metaDir, entry.Name(), "repodata")
-		if _, err := os.Stat(filepath.Join(repoDataDir, "repomd.xml")); err == nil {
-			repoIDs = append(repoIDs, entry.Name())
+		if entry.IsDir() {
+			repoDataDir := filepath.Join(metaDir, entry.Name(), "repodata")
+			if _, err := os.Stat(filepath.Join(repoDataDir, "repomd.xml")); err == nil {
+				repoIDs = append(repoIDs, entry.Name())
+			}
+		} else if strings.HasSuffix(entry.Name(), "repomd.xml") {
+			// 兼容旧版平铺结构：例如 mirrors.cloud.aliyuncs.com_alinux_3_os_aarch64_repodata_repomd.xml
+			repoName := strings.TrimSuffix(entry.Name(), "_repomd.xml")
+			repoName = strings.TrimSuffix(repoName, ".repomd.xml")
+			targetDir := filepath.Join(metaDir, repoName, "repodata")
+			os.MkdirAll(targetDir, 0755)
+			srcPath := filepath.Join(metaDir, entry.Name())
+			dstPath := filepath.Join(targetDir, "repomd.xml")
+			// 复制或移动
+			data, err := os.ReadFile(srcPath)
+			if err == nil {
+				os.WriteFile(dstPath, data, 0644)
+				repoIDs = append(repoIDs, repoName)
+			}
 		}
 	}
 
 	if len(repoIDs) == 0 {
-		return nil, fmt.Errorf("元数据目录中未找到任何有效的 repo 结构 (需要 {repo_id}/repodata/repomd.xml)")
+		return nil, fmt.Errorf("元数据包中未找到任何有效的 repomd.xml 文件。\n" +
+			"排障提示：请在外网机器使用最新版本运行 sync-meta 下载完整的 metadata.bundle")
+	}
+
+	// 检查是否包含实际的包数据库 (primary.xml.gz 等)
+	hasDatabaseFiles := false
+	filepath.Walk(metaDir, func(path string, info os.FileInfo, err error) error {
+		if err == nil && !info.IsDir() {
+			name := info.Name()
+			if strings.Contains(name, "primary") || strings.Contains(name, "filelists") ||
+				strings.HasSuffix(name, ".xml.gz") || strings.HasSuffix(name, ".sqlite.bz2") {
+				hasDatabaseFiles = true
+			}
+		}
+		return nil
+	})
+
+	if !hasDatabaseFiles {
+		return nil, fmt.Errorf("检测到 metadata.bundle 中仅包含仓库索引 (repomd.xml)，缺少核心依赖数据库 (primary.xml.gz)。\n" +
+			"原因：旧版 sync-meta 仅拉取了索引文件，无法完成离线依赖计算。\n" +
+			"解决方案：请在外网机器使用最新版 netlesspkg 重新执行:\n" +
+			"  netlesspkg sync-meta -i meta_request.json -o metadata.bundle")
 	}
 
 	// 创建临时 repos.d 目录，为每个 repo 生成 .repo 配置
@@ -284,7 +319,7 @@ func (m *YUMManager) queryWithLocalRepos(metaDir string, isDnf bool, targetPacka
 		return nil, fmt.Errorf("写入临时 repo 配置失败: %v", err)
 	}
 
-	fmt.Printf("[plan] 已加载 %d 个离线仓库: %s\n", len(repoIDs), strings.Join(repoIDs, ", "))
+	fmt.Printf("[plan] 已成功加载 %d 个离线仓库: %s\n", len(repoIDs), strings.Join(repoIDs, ", "))
 
 	// 使用 dnf/yum 查询
 	allURLs := make(map[string]bool)

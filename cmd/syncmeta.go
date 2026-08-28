@@ -1,10 +1,13 @@
 package cmd
 
 import (
+	"crypto/md5"
+	"encoding/hex"
 	"encoding/json"
 	"encoding/xml"
 	"flag"
 	"fmt"
+	"net/url"
 	"netlesspkg/pkg/archive"
 	"netlesspkg/pkg/core"
 	"netlesspkg/pkg/downloader"
@@ -69,11 +72,28 @@ func runSyncMeta(args []string) {
 	}
 	defer os.RemoveAll(tmpDir)
 
-	// 第 1 轮：下载所有 repomd.xml 和其他元数据
+	// 规范化 MetaFile 列表（兼容旧版 meta_request.json）
+	normalizedFiles := make([]core.MetaFile, 0, len(req.Files))
+	for _, f := range req.Files {
+		norm := f
+		if req.OSFamily == "rhel" {
+			if norm.BaseURL == "" && strings.Contains(norm.URL, "repodata/repomd.xml") {
+				norm.BaseURL = norm.URL[:strings.Index(norm.URL, "repodata/repomd.xml")]
+			}
+			if norm.RepoID == "" {
+				norm.RepoID = inferRepoID(norm.URL, norm.SavePath)
+			}
+			// 统一组织为 {repo_id}/repodata/repomd.xml 目录结构
+			norm.SavePath = filepath.Join(norm.RepoID, "repodata", "repomd.xml")
+		}
+		normalizedFiles = append(normalizedFiles, norm)
+	}
+
+	// 第 1 轮：下载所有索引元数据 (repomd.xml / Packages.gz 等)
 	var tasks []downloader.DownloadTask
 	replacedCount := 0
 
-	for _, f := range req.Files {
+	for _, f := range normalizedFiles {
 		downloadURL, replaced, reason := rewriter.RewriteURL(f.URL)
 		if replaced {
 			replacedCount++
@@ -91,7 +111,7 @@ func runSyncMeta(args []string) {
 		fmt.Printf("[URL 重写] 共计重写了 %d 个内网源 URL 为公网镜像源\n", replacedCount)
 	}
 
-	fmt.Printf("正在下载 %d 个元数据文件...\n", len(tasks))
+	fmt.Printf("正在下载 %d 个索引元数据文件...\n", len(tasks))
 	results := downloader.Download(tasks, downloader.Options{
 		Concurrency:  4,
 		RetryCount:   3,
@@ -115,11 +135,11 @@ func runSyncMeta(args []string) {
 		os.Exit(1)
 	}
 
-	// 第 2 轮：解析 YUM repomd.xml，下载引用的附加元数据 (primary.xml.gz 等)
+	// 第 2 轮：解析 YUM repomd.xml，递归下载引用的附加元数据 (primary.xml.gz, filelists 等)
 	if req.OSFamily == "rhel" {
-		extraTasks := parseAndCollectRepomdFiles(req.Files, tmpDir, rewriter)
+		extraTasks := parseAndCollectRepomdFiles(normalizedFiles, tmpDir, rewriter)
 		if len(extraTasks) > 0 {
-			fmt.Printf("\n正在下载 %d 个附加元数据文件 (primary, filelists 等)...\n", len(extraTasks))
+			fmt.Printf("\n正在下载 %d 个核心包依赖数据库 (primary.xml, filelists 等)...\n", len(extraTasks))
 			extraResults := downloader.Download(extraTasks, downloader.Options{
 				Concurrency:  4,
 				RetryCount:   3,
@@ -145,7 +165,25 @@ func runSyncMeta(args []string) {
 		os.Exit(1)
 	}
 
-	fmt.Printf("✅ 成功同步元数据到 %s\n", *outFile)
+	fmt.Printf("\n✅ 成功同步全量元数据到 %s\n", *outFile)
+}
+
+// inferRepoID 从 URL 或 SavePath 推导一个可读的 Repo ID
+func inferRepoID(rawURL, savePath string) string {
+	u, err := url.Parse(rawURL)
+	if err == nil && u.Path != "" {
+		p := strings.Trim(u.Path, "/")
+		p = strings.TrimSuffix(p, "/repodata/repomd.xml")
+		p = strings.TrimSuffix(p, "repodata/repomd.xml")
+		parts := strings.Split(p, "/")
+		if len(parts) >= 2 {
+			return strings.Join(parts[len(parts)-2:], "-")
+		} else if len(parts) == 1 && parts[0] != "" {
+			return parts[0]
+		}
+	}
+	hash := md5.Sum([]byte(rawURL))
+	return "repo-" + hex.EncodeToString(hash[:4])
 }
 
 // parseAndCollectRepomdFiles 解析已下载的 repomd.xml 文件，收集引用的附加元数据下载任务
@@ -154,18 +192,13 @@ func parseAndCollectRepomdFiles(files []core.MetaFile, tmpDir string, rewriter *
 	seen := make(map[string]bool)
 
 	for _, f := range files {
-		// 只处理 repomd.xml 文件
 		if f.BaseURL == "" || f.RepoID == "" {
-			continue
-		}
-		if !strings.HasSuffix(f.SavePath, "repomd.xml") {
 			continue
 		}
 
 		repomdPath := filepath.Join(tmpDir, filepath.FromSlash(f.SavePath))
 		xmlData, err := os.ReadFile(repomdPath)
 		if err != nil {
-			fmt.Printf("警告: 无法读取 %s: %v\n", repomdPath, err)
 			continue
 		}
 
@@ -181,10 +214,14 @@ func parseAndCollectRepomdFiles(files []core.MetaFile, tmpDir string, rewriter *
 			}
 
 			// 构建完整 URL: baseURL + location.href
-			fullURL := f.BaseURL + d.Location.Href
+			base := f.BaseURL
+			if !strings.HasSuffix(base, "/") {
+				base += "/"
+			}
+			fullURL := base + strings.TrimPrefix(d.Location.Href, "/")
 			downloadURL, _, _ := rewriter.RewriteURL(fullURL)
 
-			// save_path: {repo_id}/{location.href}
+			// save_path 必须对应仓库的 {repo_id}/{location.href}
 			savePath := filepath.Join(tmpDir, f.RepoID, filepath.FromSlash(d.Location.Href))
 
 			if seen[downloadURL] {
