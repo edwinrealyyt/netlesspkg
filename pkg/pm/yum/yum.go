@@ -430,13 +430,13 @@ func (m *YUMManager) queryWithLocalRepos(metaDir string, isDnf bool, targetPacka
 
 		fmt.Printf("[plan] 依赖分析完成，目标系统需安装 %d 个离线包（已自动排除系统已满足的底层库）\n", len(neededPackages))
 
-		// 4. 第三阶段：根据精确缺失包列表批量查询真实的下载 URL 及文件大小
+		// 4. 第三阶段：根据精确缺失包列表批量查询真实的下载 URL
 		argsURLs := []string{
 			"--noplugins",
 			"--setopt=reposdir=" + tmpReposDir,
 			"--setopt=cachedir=" + tmpCacheDir,
 			"--setopt=keepcache=1",
-			"repoquery", "--queryformat", "%{location}\t%{size}", "--latest-limit=1",
+			"repoquery", "--location", "--latest-limit=1",
 			"--disablerepo=*",
 			"--releasever=" + releaseVer,
 		}
@@ -451,43 +451,46 @@ func (m *YUMManager) queryWithLocalRepos(metaDir string, isDnf bool, targetPacka
 		cmdURLs.Stderr = &stderrURLs
 
 		if err := cmdURLs.Run(); err != nil {
-			// 如果 --queryformat 报错，尝试回退到 --location
-			argsFallback := []string{
-				"--noplugins",
-				"--setopt=reposdir=" + tmpReposDir,
-				"--setopt=cachedir=" + tmpCacheDir,
-				"repoquery", "--location", "--latest-limit=1",
-				"--disablerepo=*",
-				"--releasever=" + releaseVer,
-			}
-			for _, id := range repoIDs {
-				argsFallback = append(argsFallback, "--enablerepo="+id)
-			}
-			argsFallback = append(argsFallback, neededPackages...)
-			cmdFallback := exec.Command(m.cmdPath, argsFallback...)
-			cmdFallback.Stdout = &outURLs
-			_ = cmdFallback.Run()
+			return nil, fmt.Errorf("dnf repoquery (下载链接查询) 失败: %v\n  stderr: %s", err, stderrURLs.String())
 		}
 
 		for _, line := range strings.Split(outURLs.String(), "\n") {
 			line = strings.TrimSpace(line)
-			if line == "" {
-				continue
+			if isPackageURL(line) {
+				allURLs[line] = 0
 			}
-			parts := strings.Split(line, "\t")
-			if len(parts) >= 2 {
-				url := strings.TrimSpace(parts[0])
-				size, _ := strconv.ParseInt(strings.TrimSpace(parts[1]), 10, 64)
-				if isPackageURL(url) {
-					allURLs[url] = size
+		}
+
+		// 5. 辅助查询包文件大小 (Size)
+		argsSizes := []string{
+			"--noplugins",
+			"--setopt=reposdir=" + tmpReposDir,
+			"--setopt=cachedir=" + tmpCacheDir,
+			"repoquery", "--queryformat", "%{name}\t%{size}", "--latest-limit=1",
+			"--disablerepo=*",
+			"--releasever=" + releaseVer,
+		}
+		for _, id := range repoIDs {
+			argsSizes = append(argsSizes, "--enablerepo="+id)
+		}
+		argsSizes = append(argsSizes, neededPackages...)
+		cmdSizes := exec.Command(m.cmdPath, argsSizes...)
+		var outSizes bytes.Buffer
+		cmdSizes.Stdout = &outSizes
+		if err := cmdSizes.Run(); err == nil {
+			pkgSizes := make(map[string]int64)
+			for _, line := range strings.Split(outSizes.String(), "\n") {
+				parts := strings.Split(strings.TrimSpace(line), "\t")
+				if len(parts) >= 2 {
+					name := strings.TrimSpace(parts[0])
+					size, _ := strconv.ParseInt(strings.TrimSpace(parts[1]), 10, 64)
+					pkgSizes[name] = size
 				}
-			} else {
-				fields := strings.Fields(line)
-				if len(fields) >= 2 && isPackageURL(fields[0]) {
-					size, _ := strconv.ParseInt(fields[1], 10, 64)
-					allURLs[fields[0]] = size
-				} else if isPackageURL(line) {
-					allURLs[line] = 0
+			}
+			for url := range allURLs {
+				baseName := extractRPMBaseName(url)
+				if sz, ok := pkgSizes[baseName]; ok {
+					allURLs[url] = sz
 				}
 			}
 		}
@@ -552,24 +555,8 @@ func (m *YUMManager) queryWithLocalRepos(metaDir string, isDnf bool, targetPacka
 		}
 		for _, line := range strings.Split(outURLs.String(), "\n") {
 			line = strings.TrimSpace(line)
-			if line == "" {
-				continue
-			}
-			parts := strings.Split(line, "\t")
-			if len(parts) >= 2 {
-				url := strings.TrimSpace(parts[0])
-				size, _ := strconv.ParseInt(strings.TrimSpace(parts[1]), 10, 64)
-				if isPackageURL(url) {
-					allURLs[url] = size
-				}
-			} else {
-				fields := strings.Fields(line)
-				if len(fields) >= 2 && isPackageURL(fields[0]) {
-					size, _ := strconv.ParseInt(fields[1], 10, 64)
-					allURLs[fields[0]] = size
-				} else if isPackageURL(line) {
-					allURLs[line] = 0
-				}
+			if isPackageURL(line) {
+				allURLs[line] = 0
 			}
 		}
 	}
