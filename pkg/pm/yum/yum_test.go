@@ -5,10 +5,10 @@ import (
 )
 
 func TestRestoreRemoteURLs(t *testing.T) {
-	urls := map[string]bool{
-		"file:///tmp/netlesspkg-plan-2733915488/alinux3-plus/Packages/xrdp-0.9.23.1-1.al8.aarch64.rpm": true,
-		"file:///tmp/netlesspkg-plan-2733915488/epel/Packages/x/xrdp-0.10.6.1-3.el8.aarch64.rpm":        true,
-		"http://mirrors.aliyun.com/epel/8/Everything/x86_64/Packages/n/nginx.rpm":                       true,
+	urls := map[string]int64{
+		"file:///tmp/netlesspkg-plan-2733915488/alinux3-plus/Packages/xrdp-0.9.23.1-1.al8.aarch64.rpm": 560000,
+		"file:///tmp/netlesspkg-plan-2733915488/epel/Packages/x/xrdp-0.10.6.1-3.el8.aarch64.rpm":        580000,
+		"http://mirrors.aliyun.com/epel/8/Everything/x86_64/Packages/n/nginx.rpm":                       120000,
 	}
 
 	repoBaseURLs := map[string]string{

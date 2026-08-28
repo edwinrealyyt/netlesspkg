@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"os/user"
 	"path/filepath"
+	"strconv"
 	"strings"
 
 	"netlesspkg/pkg/core"
@@ -335,7 +336,7 @@ func (m *YUMManager) queryWithLocalRepos(metaDir string, isDnf bool, targetPacka
 	fmt.Printf("[plan] 已成功加载 %d 个离线仓库: %s\n", len(repoIDs), strings.Join(repoIDs, ", "))
 
 	// 使用 dnf/yum 查询
-	allURLs := make(map[string]bool)
+	allURLs := make(map[string]int64)
 
 	if isDnf {
 		releaseVer := getReleaseVer()
@@ -429,13 +430,13 @@ func (m *YUMManager) queryWithLocalRepos(metaDir string, isDnf bool, targetPacka
 
 		fmt.Printf("[plan] 依赖分析完成，目标系统需安装 %d 个离线包（已自动排除系统已满足的底层库）\n", len(neededPackages))
 
-		// 4. 第三阶段：根据精确缺失包列表批量查询真实的下载 URL
+		// 4. 第三阶段：根据精确缺失包列表批量查询真实的下载 URL 及文件大小
 		argsURLs := []string{
 			"--noplugins",
 			"--setopt=reposdir=" + tmpReposDir,
 			"--setopt=cachedir=" + tmpCacheDir,
 			"--setopt=keepcache=1",
-			"repoquery", "--location", "--latest-limit=1",
+			"repoquery", "--queryformat", "%{location}\t%{size}", "--latest-limit=1",
 			"--disablerepo=*",
 			"--releasever=" + releaseVer,
 		}
@@ -450,13 +451,44 @@ func (m *YUMManager) queryWithLocalRepos(metaDir string, isDnf bool, targetPacka
 		cmdURLs.Stderr = &stderrURLs
 
 		if err := cmdURLs.Run(); err != nil {
-			return nil, fmt.Errorf("dnf repoquery (下载链接查询) 失败: %v\n  stderr: %s", err, stderrURLs.String())
+			// 如果 --queryformat 报错，尝试回退到 --location
+			argsFallback := []string{
+				"--noplugins",
+				"--setopt=reposdir=" + tmpReposDir,
+				"--setopt=cachedir=" + tmpCacheDir,
+				"repoquery", "--location", "--latest-limit=1",
+				"--disablerepo=*",
+				"--releasever=" + releaseVer,
+			}
+			for _, id := range repoIDs {
+				argsFallback = append(argsFallback, "--enablerepo="+id)
+			}
+			argsFallback = append(argsFallback, neededPackages...)
+			cmdFallback := exec.Command(m.cmdPath, argsFallback...)
+			cmdFallback.Stdout = &outURLs
+			_ = cmdFallback.Run()
 		}
 
 		for _, line := range strings.Split(outURLs.String(), "\n") {
 			line = strings.TrimSpace(line)
-			if isPackageURL(line) {
-				allURLs[line] = true
+			if line == "" {
+				continue
+			}
+			parts := strings.Split(line, "\t")
+			if len(parts) >= 2 {
+				url := strings.TrimSpace(parts[0])
+				size, _ := strconv.ParseInt(strings.TrimSpace(parts[1]), 10, 64)
+				if isPackageURL(url) {
+					allURLs[url] = size
+				}
+			} else {
+				fields := strings.Fields(line)
+				if len(fields) >= 2 && isPackageURL(fields[0]) {
+					size, _ := strconv.ParseInt(fields[1], 10, 64)
+					allURLs[fields[0]] = size
+				} else if isPackageURL(line) {
+					allURLs[line] = 0
+				}
 			}
 		}
 	} else {
@@ -520,8 +552,24 @@ func (m *YUMManager) queryWithLocalRepos(metaDir string, isDnf bool, targetPacka
 		}
 		for _, line := range strings.Split(outURLs.String(), "\n") {
 			line = strings.TrimSpace(line)
-			if isPackageURL(line) {
-				allURLs[line] = true
+			if line == "" {
+				continue
+			}
+			parts := strings.Split(line, "\t")
+			if len(parts) >= 2 {
+				url := strings.TrimSpace(parts[0])
+				size, _ := strconv.ParseInt(strings.TrimSpace(parts[1]), 10, 64)
+				if isPackageURL(url) {
+					allURLs[url] = size
+				}
+			} else {
+				fields := strings.Fields(line)
+				if len(fields) >= 2 && isPackageURL(fields[0]) {
+					size, _ := strconv.ParseInt(fields[1], 10, 64)
+					allURLs[fields[0]] = size
+				} else if isPackageURL(line) {
+					allURLs[line] = 0
+				}
 			}
 		}
 	}
@@ -652,10 +700,10 @@ func isPackageURL(s string) bool {
 }
 
 // restoreRemoteURLs 将 DNF/YUM 返回的 local file:// URL 还原为外网可下载的真实 HTTP/HTTPS 镜像 URL
-func restoreRemoteURLs(urls map[string]bool, repoBaseURLs map[string]string, metaDir string) []core.PackageInfo {
+func restoreRemoteURLs(urls map[string]int64, repoBaseURLs map[string]string, metaDir string) []core.PackageInfo {
 	var packages []core.PackageInfo
 
-	for rawURL := range urls {
+	for rawURL, size := range urls {
 		finalURL := rawURL
 		filename := filepath.Base(rawURL)
 
@@ -698,6 +746,7 @@ func restoreRemoteURLs(urls map[string]bool, repoBaseURLs map[string]string, met
 		packages = append(packages, core.PackageInfo{
 			URL:      finalURL,
 			Filename: filename,
+			Size:     size,
 		})
 	}
 

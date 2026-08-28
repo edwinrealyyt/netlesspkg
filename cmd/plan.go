@@ -75,5 +75,29 @@ func runPlan(args []string) {
 		totalSize += p.Size
 	}
 
-	fmt.Printf("成功生成下载计划: %d 个包, 总大小约 %d 字节, 保存至 %s\n", len(pkgs), totalSize, *outFile)
+	if totalSize > 0 {
+		fmt.Printf("成功生成下载计划: %d 个包, 预计下载总大小约 %s, 保存至 %s\n", len(pkgs), formatBytes(totalSize), *outFile)
+	} else {
+		fmt.Printf("成功生成下载计划: %d 个包, 保存至 %s\n", len(pkgs), *outFile)
+	}
+}
+
+// formatBytes 将字节数转换为易读的格式 (KB/MB/GB)
+func formatBytes(bytes int64) string {
+	const (
+		KB = 1024
+		MB = 1024 * KB
+		GB = 1024 * MB
+	)
+
+	switch {
+	case bytes >= GB:
+		return fmt.Sprintf("%.2f GB", float64(bytes)/float64(GB))
+	case bytes >= MB:
+		return fmt.Sprintf("%.2f MB", float64(bytes)/float64(MB))
+	case bytes >= KB:
+		return fmt.Sprintf("%.2f KB", float64(bytes)/float64(KB))
+	default:
+		return fmt.Sprintf("%d 字节", bytes)
+	}
 }
