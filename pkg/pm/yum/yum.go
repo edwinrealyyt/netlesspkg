@@ -348,7 +348,7 @@ func (m *YUMManager) queryWithLocalRepos(metaDir string, isDnf bool, targetPacka
 			"--setopt=reposdir=" + tmpReposDir,
 			"--setopt=cachedir=" + tmpCacheDir,
 			"--setopt=keepcache=1",
-			"repoquery", "--location",
+			"repoquery", "--location", "--latest-limit=1",
 			"--disablerepo=*",
 			"--releasever=" + releaseVer,
 		}
@@ -379,7 +379,7 @@ func (m *YUMManager) queryWithLocalRepos(metaDir string, isDnf bool, targetPacka
 			"--setopt=reposdir=" + tmpReposDir,
 			"--setopt=cachedir=" + tmpCacheDir,
 			"--setopt=keepcache=1",
-			"repoquery", "--location", "--resolve", "--requires", "--recursive",
+			"repoquery", "--location", "--resolve", "--requires", "--recursive", "--latest-limit=1",
 			"--disablerepo=*",
 			"--releasever=" + releaseVer,
 		}
@@ -412,7 +412,7 @@ func (m *YUMManager) queryWithLocalRepos(metaDir string, isDnf bool, targetPacka
 		}
 		args := []string{
 			"--plugins=0",
-			"--resolve", "--requires", "--recursive", "--location",
+			"--resolve", "--requires", "--recursive", "--location", "--pkgnarrow=latest",
 			"--setopt=reposdir=" + tmpReposDir,
 		}
 		args = append(args, targetPackages...)
@@ -653,7 +653,8 @@ func (m *YUMManager) InjectPackagesAndInstall(pkgDir string, targetPackages []st
 		return fmt.Errorf("包管理器未初始化")
 	}
 
-	args := []string{"-c", fmt.Sprintf("%s install -y %s/*.rpm", m.cmdPath, strings.ReplaceAll(pkgDir, "\\", "/"))}
+	// 使用 --nogpgcheck 和 --noplugins 进行顺畅的离线本地包安装
+	args := []string{"-c", fmt.Sprintf("%s install -y --nogpgcheck --noplugins %s/*.rpm", m.cmdPath, strings.ReplaceAll(pkgDir, "\\", "/"))}
 	cmd := exec.Command("sh", args...)
 	
 	var stderr bytes.Buffer
