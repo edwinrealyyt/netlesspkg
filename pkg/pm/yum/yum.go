@@ -792,9 +792,25 @@ func (m *YUMManager) InjectPackagesAndInstall(pkgDir string, targetPackages []st
 
 	fmt.Printf("[install] 正在准备安装 %d 个 RPM 离线包...\n", len(rpmFiles))
 
+	// 预检：检测并移除与系统已安装包冲突的非目标 RPM（如 coreutils-single vs coreutils）
+	filteredDir, removed := m.preFilterConflictingRPMs(pkgDir, cleanDir, targetPackages)
+	if len(removed) > 0 {
+		fmt.Printf("[install] 预检移除了 %d 个与系统冲突的非目标依赖包:\n", len(removed))
+		for _, r := range removed {
+			fmt.Printf("  - %s\n", r)
+		}
+		// 使用过滤后的目录
+		cleanDir = filteredDir
+		rpmFiles, _ = filepath.Glob(filepath.Join(filteredDir, "*.rpm"))
+		if len(rpmFiles) == 0 {
+			return fmt.Errorf("移除冲突包后没有剩余可安装的 RPM 文件")
+		}
+	}
+
 	// 策略 1: dnf/yum install 配合 --disablerepo=* 禁用全部远端源，仅基于本地 RPM 文件计算依赖安装
 	cmdStr1 := fmt.Sprintf("%s install -y --nogpgcheck --noplugins --disablerepo=* %s/*.rpm", m.cmdPath, cleanDir)
-	fmt.Printf("[install] 策略 1: %s\n", cmdStr1)
+	fmt.Printf("[install] 策略 1: 纯离线安装（禁用所有远端源）\n")
+	fmt.Printf("[install] 执行: %s\n", cmdStr1)
 	cmd1 := exec.Command("sh", "-c", cmdStr1)
 	cmd1.Stdout = os.Stdout
 	cmd1.Stderr = os.Stderr
@@ -802,20 +818,158 @@ func (m *YUMManager) InjectPackagesAndInstall(pkgDir string, targetPackages []st
 		fmt.Println("\n✅ 软件包离线安装成功！")
 		return nil
 	}
+	fmt.Println("[install] 策略 1 失败，尝试下一策略...")
 
-	// 策略 2: 使用 rpm 原生命令批量安装/更新
-	fmt.Println("\n[install] 策略 2: 尝试使用 rpm 命令直接安装...")
-	cmdStr2 := fmt.Sprintf("rpm -Uvh --replacepkgs --replacefiles %s/*.rpm", cleanDir)
+	// 策略 2: dnf/yum install 保留系统远端源（允许从系统源补齐缺失的底层依赖如 glibc）
+	cmdStr2 := fmt.Sprintf("%s install -y --nogpgcheck --noplugins %s/*.rpm", m.cmdPath, cleanDir)
+	fmt.Printf("\n[install] 策略 2: 混合安装（允许系统源补齐缺失依赖）\n")
 	fmt.Printf("[install] 执行: %s\n", cmdStr2)
 	cmd2 := exec.Command("sh", "-c", cmdStr2)
 	cmd2.Stdout = os.Stdout
 	cmd2.Stderr = os.Stderr
 	if err2 := cmd2.Run(); err2 == nil {
-		fmt.Println("\n✅ 软件包离线安装成功！")
+		fmt.Println("\n✅ 软件包安装成功（部分依赖从系统源补齐）！")
+		return nil
+	}
+	fmt.Println("[install] 策略 2 失败，尝试下一策略...")
+
+	// 策略 3: dnf/yum install 配合 --allowerasing --skip-broken --nobest 放宽约束
+	if strings.HasSuffix(m.cmdPath, "dnf") {
+		cmdStr3 := fmt.Sprintf("%s install -y --nogpgcheck --noplugins --allowerasing --skip-broken --nobest %s/*.rpm", m.cmdPath, cleanDir)
+		fmt.Printf("\n[install] 策略 3: 宽松安装（允许替换冲突包、跳过无法安装的包）\n")
+		fmt.Printf("[install] 执行: %s\n", cmdStr3)
+		cmd3 := exec.Command("sh", "-c", cmdStr3)
+		cmd3.Stdout = os.Stdout
+		cmd3.Stderr = os.Stderr
+		if err3 := cmd3.Run(); err3 == nil {
+			fmt.Println("\n✅ 软件包安装成功（已自动处理包冲突）！")
+			return nil
+		}
+		fmt.Println("[install] 策略 3 失败，尝试下一策略...")
+	}
+
+	// 策略 4: 仅安装用户明确指定的目标包（过滤掉问题依赖）
+	fmt.Printf("\n[install] 策略 4: 精准安装（仅安装目标包，跳过问题依赖）\n")
+	targetRPMs := m.findTargetRPMs(pkgDir, targetPackages)
+	if len(targetRPMs) > 0 {
+		rpmList := strings.Join(targetRPMs, " ")
+		cmdStr4 := fmt.Sprintf("%s install -y --nogpgcheck --noplugins %s", m.cmdPath, rpmList)
+		fmt.Printf("[install] 执行: %s\n", cmdStr4)
+		cmd4 := exec.Command("sh", "-c", cmdStr4)
+		cmd4.Stdout = os.Stdout
+		cmd4.Stderr = os.Stderr
+		if err4 := cmd4.Run(); err4 == nil {
+			fmt.Println("\n✅ 目标软件包安装成功！")
+			return nil
+		}
+		fmt.Println("[install] 策略 4 失败，尝试下一策略...")
+	}
+
+	// 策略 5: rpm --nodeps 强制安装（最后手段，跳过所有依赖检查）
+	fmt.Printf("\n[install] 策略 5: 强制安装（rpm --nodeps，跳过依赖检查）\n")
+	fmt.Println("[install] ⚠️  警告: 此策略跳过依赖检查，安装后软件可能因缺少依赖而无法正常运行！")
+	cmdStr5 := fmt.Sprintf("rpm -Uvh --replacepkgs --replacefiles --nodeps %s/*.rpm", cleanDir)
+	fmt.Printf("[install] 执行: %s\n", cmdStr5)
+	cmd5 := exec.Command("sh", "-c", cmdStr5)
+	cmd5.Stdout = os.Stdout
+	cmd5.Stderr = os.Stderr
+	if err5 := cmd5.Run(); err5 == nil {
+		fmt.Println("\n⚠️  软件包已强制安装（跳过了依赖检查）！")
+		fmt.Println("建议: 请在安装后运行以下命令检查依赖完整性:")
+		fmt.Println("  rpm -Va --nofiles --nodigest")
 		return nil
 	}
 
-	return fmt.Errorf("所有离线安装策略均失败，请查看上方输出排查是否存在缺失的底层系统依赖")
+	return fmt.Errorf("所有离线安装策略均失败，请查看上方输出排查原因。\n\n排障建议:\n" +
+		"  1. 检查 bundle 中是否包含了所有必要的底层依赖包（如 glibc, glibc-common）\n" +
+		"  2. 确认 bundle 中的包版本与目标系统兼容\n" +
+		"  3. 如果目标机器有网络访问权限，可先运行: %s install -y <包名> 在线安装\n" +
+		"  4. 重新在外网机器执行 plan 阶段，不要过滤掉已安装的系统基础包")
+}
+
+// preFilterConflictingRPMs 检测 bundle 中与系统已安装包冲突的非目标 RPM，
+// 将不冲突的包复制到新的临时目录，返回新目录路径和被移除的文件名列表。
+// 典型场景: bundle 含 coreutils-single 但系统已装 coreutils，两者互斥。
+func (m *YUMManager) preFilterConflictingRPMs(pkgDir, cleanDir string, targetPackages []string) (string, []string) {
+	rpmFiles, _ := filepath.Glob(filepath.Join(pkgDir, "*.rpm"))
+	if len(rpmFiles) == 0 {
+		return cleanDir, nil
+	}
+
+	// 获取系统已安装包的完整 conflicts 信息太重，这里采用轻量策略：
+	// 检测已知的互斥包对 (Conflicts 关系)
+	knownConflicts := map[string]string{
+		"coreutils-single": "coreutils",
+		"coreutils":        "coreutils-single",
+	}
+
+	installedPkgs := getInstalledRPMNames()
+	targetSet := make(map[string]bool)
+	for _, t := range targetPackages {
+		targetSet[t] = true
+	}
+
+	var removed []string
+	var keepFiles []string
+
+	for _, rpmFile := range rpmFiles {
+		baseName := extractRPMBaseName(filepath.Base(rpmFile))
+
+		// 如果是用户明确指定的目标包，始终保留
+		if targetSet[baseName] {
+			keepFiles = append(keepFiles, rpmFile)
+			continue
+		}
+
+		// 检查是否与已安装包存在已知冲突
+		if conflictsWith, ok := knownConflicts[baseName]; ok {
+			if installedPkgs[conflictsWith] {
+				removed = append(removed, filepath.Base(rpmFile))
+				continue
+			}
+		}
+
+		keepFiles = append(keepFiles, rpmFile)
+	}
+
+	if len(removed) == 0 {
+		return cleanDir, nil
+	}
+
+	// 创建新的临时目录，仅包含不冲突的 RPM
+	filteredDir, err := os.MkdirTemp("", "netlesspkg-filtered-*")
+	if err != nil {
+		return cleanDir, nil // 失败则回退到原目录
+	}
+
+	for _, src := range keepFiles {
+		dst := filepath.Join(filteredDir, filepath.Base(src))
+		data, err := os.ReadFile(src)
+		if err != nil {
+			continue
+		}
+		os.WriteFile(dst, data, 0644)
+	}
+
+	return strings.ReplaceAll(filteredDir, "\\", "/"), removed
+}
+
+// findTargetRPMs 从 bundle 目录中找到与用户指定目标包名匹配的 RPM 文件路径
+func (m *YUMManager) findTargetRPMs(pkgDir string, targetPackages []string) []string {
+	rpmFiles, _ := filepath.Glob(filepath.Join(pkgDir, "*.rpm"))
+	targetSet := make(map[string]bool)
+	for _, t := range targetPackages {
+		targetSet[t] = true
+	}
+
+	var matched []string
+	for _, rpmFile := range rpmFiles {
+		baseName := extractRPMBaseName(filepath.Base(rpmFile))
+		if targetSet[baseName] {
+			matched = append(matched, rpmFile)
+		}
+	}
+	return matched
 }
 
 // extractRPMBaseName 从 RPM 包规范或文件名中提取基础包名 (Name)
